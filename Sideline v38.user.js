@@ -2,8 +2,8 @@
 // ==UserScript==
 // @name         Poirot V3 - Auto Fill FNSKU & Auto Confirm
 // @namespace    http://tampermonkey.net/
-// @version      31.8
-// @description  Full Poirot V3 automation + FC Research. SSCC by data-section-type. Settings menu with auto-quantity toggle. FC lookup only on manual container scans.
+// @version      31.9
+// @description  Full Poirot V3 automation + FC Research. SSCC by data-section-type. Settings menu with auto-quantity toggle. FC lookup only on manual container scans on Scan Item page.
 // @match        https://aft-poirot-website.na.aftx.amazonoperations.app/?tool=V3*
 // @match        https://aft-poirot-website.na.aftx.amazonoperations.app/*tool=V3*
 // @match        https://aft-poirot-website.na.aftx.amazonoperations.app/*
@@ -377,35 +377,29 @@
     let containerWasManualScan = false;
     let successJustFired = false;
 
-    // Track when a success banner fires — the next container change is automatic, not manual
     function markSuccessFired() {
         successJustFired = true;
         console.log('[Poirot] Success fired — next container change is automatic.');
     }
 
-    // When container ID changes, determine if it was manual or automatic
     function checkContainerChange() {
         const currentId = getSourceContainerId();
         if (!currentId) return;
 
         if (currentId !== lastKnownContainerId) {
             if (lastKnownContainerId === null) {
-                // First load — treat as manual
                 containerWasManualScan = true;
                 console.log('[Poirot] Initial container: ' + currentId + ' (treated as manual)');
             } else if (successJustFired) {
-                // Container changed right after success — this is automatic
                 containerWasManualScan = false;
                 console.log('[Poirot] Container changed to ' + currentId + ' (automatic after success)');
             } else {
-                // Container changed without a success — user manually scanned
                 containerWasManualScan = true;
                 console.log('[Poirot] Container changed to ' + currentId + ' (manual scan)');
             }
             lastKnownContainerId = currentId;
             successJustFired = false;
 
-            // Reset FC flags for new container
             emptyContainerHandled = false;
             fcDataHandled = false;
             fcEmptyHandled = false;
@@ -437,7 +431,7 @@
         headerTitle.textContent = '\u2699\uFE0F Poirot V3 Settings';
         headerTitle.style.cssText = 'font-size:16px;font-weight:bold;';
         const headerVersion = document.createElement('span');
-        headerVersion.textContent = 'v31.8';
+        headerVersion.textContent = 'v31.9';
         headerVersion.style.cssText = 'font-size:12px;color:#ff9900;background:#37475a;padding:2px 8px;border-radius:10px;';
         header.appendChild(headerTitle);
         header.appendChild(headerVersion);
@@ -917,25 +911,26 @@
         if (checkForFCData()) return;
         if (waitingForFC) return;
 
-        // Track container changes to know if manual or automatic
         checkContainerChange();
 
         if (isSidelineApp() && isScanPage() && hasSuccessBanner()) { handleSidelineSuccess(); return; }
 
-        const empty = isEmptyContainer();
-        const cid = getSourceContainerId();
+        // ONLY check for empty containers on the Scan Item page — never on Destination, Verify, Quantity, etc.
+        if (isScanPage()) {
+            const empty = isEmptyContainer();
+            const cid = getSourceContainerId();
 
-        if (empty && !emptyContainerHandled) {
-            // ONLY trigger FC Research if this was a manual container scan
-            if (!containerWasManualScan) {
-                console.log('[Poirot] Empty container after auto-transition — skipping FC lookup.');
+            if (empty && !emptyContainerHandled) {
+                if (!containerWasManualScan) {
+                    console.log('[Poirot] Empty container after auto-transition — skipping FC lookup.');
+                    return;
+                }
+                emptyContainerHandled = true;
+                if (cid) { openFCResearch(cid); } else { showFBALabelPopup(); }
                 return;
+            } else if (!empty) {
+                emptyContainerHandled = false; fcDataHandled = false; fcEmptyHandled = false; fbaPopupShown = false;
             }
-            emptyContainerHandled = true;
-            if (cid) { openFCResearch(cid); } else { showFBALabelPopup(); }
-            return;
-        } else if (!empty) {
-            emptyContainerHandled = false; fcDataHandled = false; fcEmptyHandled = false; fbaPopupShown = false;
         }
 
         if (isVerifyPage()) {
@@ -984,6 +979,6 @@
     observer.observe(document.body, { childList: true, subtree: true, characterData: true });
     setTimeout(mainCheck, 1500);
 
-    console.log('[Poirot Auto-Enter] v31.8 loaded — FC lookup only on manual container scans.');
+    console.log('[Poirot Auto-Enter] v31.9 loaded — FC lookup only on Scan Item page + manual scans only.');
 })();
 
