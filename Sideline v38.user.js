@@ -2,8 +2,8 @@
 // ==UserScript==
 // @name         Poirot V3 - Auto Fill FNSKU & Auto Confirm
 // @namespace    http://tampermonkey.net/
-// @version      32.3
-// @description  Full Poirot V3 automation + FC Research. SSCC by data-section-type. Settings menu. Shadow DOM aware. Persistent SSCC qty scraping.
+// @version      32.4
+// @description  Full Poirot V3 automation + FC Research. Find SSCC by heading text. Settings menu. Shadow DOM aware.
 // @match        https://aft-poirot-website.na.aftx.amazonoperations.app/?tool=V3*
 // @match        https://aft-poirot-website.na.aftx.amazonoperations.app/*tool=V3*
 // @match        https://aft-poirot-website.na.aftx.amazonoperations.app/*
@@ -106,12 +106,95 @@
         let foundAsin = null;
         let foundQuantity = null;
 
+        // =============================================
+        // FIND SSCC SECTION — Multiple strategies
+        // =============================================
+        function findSSCCSection() {
+            // Strategy 1: data-section-type attribute
+            let section = document.querySelector('[data-section-type="sscc-info"]');
+            if (section) {
+                console.log('[Poirot] SSCC found via data-section-type="sscc-info"');
+                return section;
+            }
+
+            section = document.querySelector('[data-section-type="sscc"]');
+            if (section) {
+                console.log('[Poirot] SSCC found via data-section-type="sscc"');
+                return section;
+            }
+
+            // Strategy 2: Find heading text "SSCC" and get parent section
+            const allHeadings = document.querySelectorAll('span, h1, h2, h3, h4, h5, h6, div, label, th, td, p');
+            for (const el of allHeadings) {
+                const text = el.textContent.trim().toLowerCase();
+                // Match "sscc information", "sscc info", or just "sscc" as a heading
+                if (text === 'sscc information' || text === 'sscc info' || text === 'sscc') {
+                    // Walk up to find the containing section/div
+                    let parent = el.parentElement;
+                    for (let i = 0; i < 5 && parent; i++) {
+                        // Check if this parent has a table inside it
+                        const table = parent.querySelector('table');
+                        if (table) {
+                            console.log('[Poirot] SSCC found via heading text "' + el.textContent.trim() + '" → parent with table');
+                            return parent;
+                        }
+                        parent = parent.parentElement;
+                    }
+                    // If no table found in parents, return the closest section-like container
+                    let container = el.closest('section') || el.closest('[class*="section"]') || el.closest('[data-section-type]') || el.parentElement;
+                    if (container) {
+                        console.log('[Poirot] SSCC found via heading text "' + el.textContent.trim() + '" → closest container');
+                        return container;
+                    }
+                }
+            }
+
+            // Strategy 3: Find by section-nav ID
+            const ssccNav = document.getElementById('sscc-info') || document.getElementById('sscc-information') || document.getElementById('sscc');
+            if (ssccNav) {
+                let parent = ssccNav.parentElement;
+                for (let i = 0; i < 5 && parent; i++) {
+                    const table = parent.querySelector('table');
+                    if (table) {
+                        console.log('[Poirot] SSCC found via #sscc-info/sscc ID → parent with table');
+                        return parent;
+                    }
+                    parent = parent.parentElement;
+                }
+            }
+
+            // Strategy 4: Find section-placeholder with sscc
+            const placeholders = document.querySelectorAll('[class*="section-placeholder"]');
+            for (const ph of placeholders) {
+                const dt = ph.getAttribute('data-section-type') || '';
+                if (dt.toLowerCase().includes('sscc')) {
+                    console.log('[Poirot] SSCC found via section-placeholder data-section-type: ' + dt);
+                    return ph;
+                }
+            }
+
+            console.log('[Poirot] SSCC section NOT found by any strategy.');
+            return null;
+        }
+
         function isInventoryHistoryEmpty() {
             const section = document.querySelector('[data-section-type="inventory-history"]');
             if (section) {
                 const text = section.textContent.trim().toLowerCase();
                 if (/no matching records/i.test(text)) return true;
                 if (/showing\s+0\s+to\s+0\s+of\s+0/i.test(text)) return true;
+            }
+            // Also try finding by heading text
+            const allEls = document.querySelectorAll('span, h1, h2, h3, h4, h5, h6');
+            for (const el of allEls) {
+                if (el.textContent.trim().toLowerCase() === 'inventory history') {
+                    let parent = el.parentElement;
+                    for (let i = 0; i < 5 && parent; i++) {
+                        const text = parent.textContent.trim().toLowerCase();
+                        if (/no matching records/i.test(text) || /showing\s+0\s+to\s+0\s+of\s+0/i.test(text)) return true;
+                        parent = parent.parentElement;
+                    }
+                }
             }
             const invTable = document.getElementById('table-inventory-history');
             if (!invTable) return section ? true : null;
@@ -162,22 +245,18 @@
             return { asin, quantity };
         }
 
-        function isSSCCSectionLoaded() {
-            return !!document.querySelector('[data-section-type="sscc-info"]');
-        }
-
         function scrapeFromSSCC() {
             let asin = null, quantity = null;
 
-            const ssccSection = document.querySelector('[data-section-type="sscc-info"]');
+            const ssccSection = findSSCCSection();
             if (!ssccSection) {
-                console.log('[Poirot] SSCC section NOT found in DOM.');
                 return { asin: null, quantity: null };
             }
 
-            console.log('[Poirot] SSCC section FOUND. Full text: ' + ssccSection.textContent.substring(0, 500));
+            const sectionText = ssccSection.textContent;
+            console.log('[Poirot] SSCC section text (first 500 chars): ' + sectionText.substring(0, 500));
 
-            // ---- APPROACH A: Try table-based scraping ----
+            // ---- APPROACH A: Table-based scraping ----
             const table = ssccSection.querySelector('table');
             if (table) {
                 const allRows = Array.from(table.querySelectorAll('tr'));
@@ -227,7 +306,7 @@
                 for (const row of dataRows) {
                     const cells = row.querySelectorAll('td');
                     const rowText = row.textContent.trim().toLowerCase();
-                    if (rowText.includes('no matching') || rowText.includes('no data')) continue;
+                    if (rowText.includes('no matching') || rowText.includes('no data') || rowText.includes('showing 0')) continue;
                     if (cells.length === 0) continue;
 
                     if (asinIdx >= 0 && asinIdx < cells.length) {
@@ -243,7 +322,6 @@
                         console.log('[Poirot] SSCC qty cell [idx ' + qtyIdx + '] raw: "' + raw + '" → qty: ' + quantity);
                     }
 
-                    // Fallback: find ASIN by pattern in any cell
                     if (!asin) {
                         for (const cell of cells) {
                             const link = cell.querySelector('a');
@@ -252,7 +330,6 @@
                         }
                     }
 
-                    // Fallback: find quantity as any standalone number
                     if (asin && !quantity) {
                         for (let i = 0; i < cells.length; i++) {
                             if (i === asinIdx) continue;
@@ -265,13 +342,11 @@
                 }
             }
 
-            // ---- APPROACH B: Text-based scraping from entire SSCC section ----
+            // ---- APPROACH B: Text-based regex on section text ----
             if (!asin || !quantity) {
-                console.log('[Poirot] SSCC table approach incomplete (ASIN: ' + asin + ', Qty: ' + quantity + '). Trying text-based approach...');
-                const sectionText = ssccSection.textContent;
+                console.log('[Poirot] Table approach incomplete (ASIN: ' + asin + ', Qty: ' + quantity + '). Trying text regex...');
 
                 if (!asin) {
-                    // Look for ASIN label followed by value
                     const asinLabelMatch = sectionText.match(/ASIN[:\s]+([A-Z0-9]{10})/i);
                     if (asinLabelMatch) {
                         asin = asinLabelMatch[1];
@@ -289,7 +364,6 @@
                 }
 
                 if (!quantity) {
-                    // Look for Quantity label followed by number
                     const qtyLabelMatch = sectionText.match(/Quantity[:\s]+(\d+)/i);
                     if (qtyLabelMatch) {
                         quantity = qtyLabelMatch[1];
@@ -298,7 +372,7 @@
                 }
             }
 
-            // ---- APPROACH C: Walk all cells/spans looking for labeled pairs ----
+            // ---- APPROACH C: Cell-walk for labeled pairs ----
             if (!asin || !quantity) {
                 console.log('[Poirot] Trying cell-walk approach...');
                 const allElements = ssccSection.querySelectorAll('td, th, span, div, p, label, dt, dd');
@@ -309,14 +383,8 @@
                     const text = el.textContent.trim();
                     const lower = text.toLowerCase();
 
-                    if (lower === 'asin' || lower === 'asin:') {
-                        nextIsAsin = true;
-                        continue;
-                    }
-                    if (lower === 'quantity' || lower === 'quantity:' || lower === 'qty' || lower === 'qty:') {
-                        nextIsQty = true;
-                        continue;
-                    }
+                    if (lower === 'asin' || lower === 'asin:') { nextIsAsin = true; continue; }
+                    if (lower === 'quantity' || lower === 'quantity:' || lower === 'qty' || lower === 'qty:') { nextIsQty = true; continue; }
 
                     if (nextIsAsin && !asin) {
                         const link = el.querySelector ? el.querySelector('a') : null;
@@ -365,11 +433,11 @@
                 if (ssccData.quantity) quantity = ssccData.quantity;
             }
 
-            // Persist best results so far
+            // Persist best results across retries
             if (asin) foundAsin = asin;
             if (quantity) foundQuantity = quantity;
 
-            console.log('[Poirot] Attempt ' + scrapeAttempts + '/' + MAX_SCRAPE_ATTEMPTS + ' — ASIN: ' + (foundAsin || 'null') + ', Qty: ' + (foundQuantity || 'null'));
+            console.log('[Poirot] Attempt ' + scrapeAttempts + '/' + MAX_SCRAPE_ATTEMPTS + ' — Best ASIN: ' + (foundAsin || 'null') + ', Best Qty: ' + (foundQuantity || 'null'));
 
             // SUCCESS: Both found
             if (foundAsin && foundQuantity) {
@@ -382,12 +450,8 @@
                 return;
             }
 
-            // Keep retrying if we haven't hit max
+            // Keep retrying
             if (scrapeAttempts < MAX_SCRAPE_ATTEMPTS) {
-                // If we have ASIN but no quantity, keep trying specifically for quantity
-                if (foundAsin && !foundQuantity) {
-                    console.log('[Poirot] Have ASIN but no Qty — retrying for quantity...');
-                }
                 setTimeout(scrapeAndSend, SCRAPE_RETRY_DELAY);
                 return;
             }
@@ -396,22 +460,13 @@
             scrapeDone = true;
 
             if (foundAsin) {
-                // Have ASIN but no quantity after all attempts — send what we have
                 setCrossCookie('poirot_fc_asin', foundAsin);
-                if (foundQuantity) {
-                    setCrossCookie('poirot_fc_quantity', foundQuantity);
-                }
+                if (foundQuantity) setCrossCookie('poirot_fc_quantity', foundQuantity);
                 setCrossCookie('poirot_fc_ready', 'true');
                 console.log('[Poirot] MAX ATTEMPTS — sending ASIN: ' + foundAsin + ', Qty: ' + (foundQuantity || 'NOT FOUND'));
                 setTimeout(() => { window.close(); }, 500);
             } else {
-                // Nothing found at all
-                const ssccLoaded = isSSCCSectionLoaded();
-                if (invEmpty === true && (ssccLoaded || scrapeAttempts >= 10)) {
-                    setCrossCookie('poirot_fc_empty', 'true');
-                } else {
-                    setCrossCookie('poirot_fc_empty', 'true');
-                }
+                setCrossCookie('poirot_fc_empty', 'true');
                 console.log('[Poirot] MAX ATTEMPTS — no data found, signaling empty.');
                 setTimeout(() => { window.close(); }, 500);
             }
@@ -490,9 +545,7 @@
         if (changeBtn) {
             if (!isDestinationPage() && !isVerifyPage() && !isQuantityPage()) {
                 const bodyText = document.body.textContent.toLowerCase();
-                if (bodyText.includes('no items found') || bodyText.includes('item quantity')) {
-                    return true;
-                }
+                if (bodyText.includes('no items found') || bodyText.includes('item quantity')) return true;
                 const input = getScanInput();
                 if (input) {
                     const placeholder = (input.placeholder || '').toLowerCase();
@@ -501,9 +554,7 @@
             }
         }
         const bodyText = document.body.textContent.toLowerCase();
-        if (bodyText.includes('scan item') && !bodyText.includes('enter quantity') && !bodyText.includes('scan destination') && !bodyText.includes('verify item')) {
-            return true;
-        }
+        if (bodyText.includes('scan item') && !bodyText.includes('enter quantity') && !bodyText.includes('scan destination') && !bodyText.includes('verify item')) return true;
         return false;
     }
 
@@ -600,7 +651,7 @@
         headerTitle.textContent = '\u2699\uFE0F Poirot V3 Settings';
         headerTitle.style.cssText = 'font-size:16px;font-weight:bold;';
         const headerVersion = document.createElement('span');
-        headerVersion.textContent = 'v32.3';
+        headerVersion.textContent = 'v32.4';
         headerVersion.style.cssText = 'font-size:12px;color:#ff9900;background:#37475a;padding:2px 8px;border-radius:10px;';
         header.appendChild(headerTitle);
         header.appendChild(headerVersion);
@@ -1012,8 +1063,6 @@
                 if (quantity) {
                     sessionStorage.setItem('poirot_fc_quantity', quantity);
                     console.log('[Poirot] Quantity stored in sessionStorage: ' + quantity);
-                } else {
-                    console.log('[Poirot] WARNING: No quantity received from FC Research.');
                 }
                 return true;
             }
@@ -1125,6 +1174,4 @@
     observer.observe(document.body, { childList: true, subtree: true, characterData: true });
     setTimeout(mainCheck, 1500);
 
-    console.log('[Poirot Auto-Enter] v32.3 loaded — persistent SSCC qty scraping + 3 scrape approaches.');
-})();
-
+    console
