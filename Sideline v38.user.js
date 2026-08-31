@@ -2,8 +2,8 @@
 // ==UserScript==
 // @name         Poirot V3 - Auto Fill FNSKU & Auto Confirm
 // @namespace    http://tampermonkey.net/
-// @version      31.9
-// @description  Full Poirot V3 automation + FC Research. SSCC by data-section-type. Settings menu with auto-quantity toggle. FC lookup only on manual container scans on Scan Item page.
+// @version      32.0
+// @description  Full Poirot V3 automation + FC Research. SSCC by data-section-type. Settings menu. FC lookup on Scan Item page only, with success cooldown.
 // @match        https://aft-poirot-website.na.aftx.amazonoperations.app/?tool=V3*
 // @match        https://aft-poirot-website.na.aftx.amazonoperations.app/*tool=V3*
 // @match        https://aft-poirot-website.na.aftx.amazonoperations.app/*
@@ -358,6 +358,7 @@
     const DELAY_BEFORE_CONFIRM = 300;
     const DELAY_BEFORE_CHANGE_CONTAINER = 600;
     const DELAY_AFTER_SUCCESS_BANNER = 800;
+    const SUCCESS_COOLDOWN_MS = 5000;
 
     let lastFilledFNSKU = '';
     let verifyHandled = false;
@@ -371,40 +372,17 @@
     let waitingForFC = false;
 
     // =============================================
-    // MANUAL CONTAINER SCAN TRACKING
+    // SUCCESS COOLDOWN — simple timer approach
     // =============================================
-    let lastKnownContainerId = null;
-    let containerWasManualScan = false;
-    let successJustFired = false;
+    let lastSuccessTime = 0;
 
     function markSuccessFired() {
-        successJustFired = true;
-        console.log('[Poirot] Success fired — next container change is automatic.');
+        lastSuccessTime = Date.now();
+        console.log('[Poirot] Success fired — cooldown started (' + SUCCESS_COOLDOWN_MS + 'ms).');
     }
 
-    function checkContainerChange() {
-        const currentId = getSourceContainerId();
-        if (!currentId) return;
-
-        if (currentId !== lastKnownContainerId) {
-            if (lastKnownContainerId === null) {
-                containerWasManualScan = true;
-                console.log('[Poirot] Initial container: ' + currentId + ' (treated as manual)');
-            } else if (successJustFired) {
-                containerWasManualScan = false;
-                console.log('[Poirot] Container changed to ' + currentId + ' (automatic after success)');
-            } else {
-                containerWasManualScan = true;
-                console.log('[Poirot] Container changed to ' + currentId + ' (manual scan)');
-            }
-            lastKnownContainerId = currentId;
-            successJustFired = false;
-
-            emptyContainerHandled = false;
-            fcDataHandled = false;
-            fcEmptyHandled = false;
-            fbaPopupShown = false;
-        }
+    function isInSuccessCooldown() {
+        return (Date.now() - lastSuccessTime) < SUCCESS_COOLDOWN_MS;
     }
 
     // =============================================
@@ -431,7 +409,7 @@
         headerTitle.textContent = '\u2699\uFE0F Poirot V3 Settings';
         headerTitle.style.cssText = 'font-size:16px;font-weight:bold;';
         const headerVersion = document.createElement('span');
-        headerVersion.textContent = 'v31.9';
+        headerVersion.textContent = 'v32.0';
         headerVersion.style.cssText = 'font-size:12px;color:#ff9900;background:#37475a;padding:2px 8px;border-radius:10px;';
         header.appendChild(headerTitle);
         header.appendChild(headerVersion);
@@ -911,18 +889,16 @@
         if (checkForFCData()) return;
         if (waitingForFC) return;
 
-        checkContainerChange();
-
         if (isSidelineApp() && isScanPage() && hasSuccessBanner()) { handleSidelineSuccess(); return; }
 
-        // ONLY check for empty containers on the Scan Item page — never on Destination, Verify, Quantity, etc.
-        if (isScanPage()) {
+        // ONLY check for empty containers on the Scan Item page AND not during success cooldown
+        if (isScanPage() && !hasSuccessBanner()) {
             const empty = isEmptyContainer();
             const cid = getSourceContainerId();
 
             if (empty && !emptyContainerHandled) {
-                if (!containerWasManualScan) {
-                    console.log('[Poirot] Empty container after auto-transition — skipping FC lookup.');
+                if (isInSuccessCooldown()) {
+                    console.log('[Poirot] Empty container during success cooldown — skipping FC lookup.');
                     return;
                 }
                 emptyContainerHandled = true;
@@ -979,6 +955,6 @@
     observer.observe(document.body, { childList: true, subtree: true, characterData: true });
     setTimeout(mainCheck, 1500);
 
-    console.log('[Poirot Auto-Enter] v31.9 loaded — FC lookup only on Scan Item page + manual scans only.');
+    console.log('[Poirot Auto-Enter] v32.0 loaded — FC lookup on Scan Item page only, with 5s success cooldown.');
 })();
 
