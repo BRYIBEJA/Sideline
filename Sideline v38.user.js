@@ -2,8 +2,8 @@
 // ==UserScript==
 // @name         Poirot V3 - Auto Fill FNSKU & Auto Confirm
 // @namespace    http://tampermonkey.net/
-// @version      32.0
-// @description  Full Poirot V3 automation + FC Research. SSCC by data-section-type. Settings menu. FC lookup on Scan Item page only, with success cooldown.
+// @version      32.1
+// @description  Full Poirot V3 automation + FC Research. SSCC by data-section-type. Settings menu. Robust empty container detection.
 // @match        https://aft-poirot-website.na.aftx.amazonoperations.app/?tool=V3*
 // @match        https://aft-poirot-website.na.aftx.amazonoperations.app/*tool=V3*
 // @match        https://aft-poirot-website.na.aftx.amazonoperations.app/*
@@ -372,7 +372,7 @@
     let waitingForFC = false;
 
     // =============================================
-    // SUCCESS COOLDOWN — simple timer approach
+    // SUCCESS COOLDOWN
     // =============================================
     let lastSuccessTime = 0;
 
@@ -409,7 +409,7 @@
         headerTitle.textContent = '\u2699\uFE0F Poirot V3 Settings';
         headerTitle.style.cssText = 'font-size:16px;font-weight:bold;';
         const headerVersion = document.createElement('span');
-        headerVersion.textContent = 'v32.0';
+        headerVersion.textContent = 'v32.1';
         headerVersion.style.cssText = 'font-size:12px;color:#ff9900;background:#37475a;padding:2px 8px;border-radius:10px;';
         header.appendChild(headerTitle);
         header.appendChild(headerVersion);
@@ -624,16 +624,64 @@
         }
         return false;
     }
+
     function isEmptyContainer() {
+        // Approach 1: Check specific span classes
         const spans = document.querySelectorAll('span.text--size-lg, span.text');
-        for (const el of spans) { if (el.textContent.trim().includes('No items found in this container')) return true; }
+        for (const el of spans) {
+            if (el.textContent.trim().toLowerCase().includes('no items found')) return true;
+        }
+        // Approach 2: Check item quantity = 0 AND number of rows = 0
+        const bodyText = document.body.textContent.toLowerCase();
+        if (bodyText.includes('item quantity') && bodyText.includes('number of rows')) {
+            const qtyMatch = bodyText.match(/item\s*quantity[:\s]*(\d+)/i);
+            const rowMatch = bodyText.match(/number\s*of\s*rows[:\s]*(\d+)/i);
+            if (qtyMatch && rowMatch && qtyMatch[1] === '0' && rowMatch[1] === '0') {
+                console.log('[Poirot] Empty container detected via qty=0, rows=0');
+                return true;
+            }
+        }
+        // Approach 3: Broad text search for "no items found"
+        if (bodyText.includes('no items found in this container')) {
+            console.log('[Poirot] Empty container detected via body text search');
+            return true;
+        }
         return false;
     }
+
     function getSourceContainerId() {
+        // Approach 1: Direct ID lookup
         const label = document.getElementById('source-container-label');
-        if (!label) return null;
-        const text = label.textContent.trim();
-        return isValidContainerId(text) ? text : null;
+        if (label) {
+            const text = label.textContent.trim();
+            if (isValidContainerId(text)) return text;
+        }
+        // Approach 2: Search all elements near "Source Container" text
+        const allEls = document.querySelectorAll('span, div, p, label, h1, h2, h3, h4, h5, h6');
+        for (const el of allEls) {
+            const text = el.textContent.trim();
+            if (isValidContainerId(text)) {
+                const parent = el.parentElement;
+                if (parent) {
+                    const parentText = parent.textContent.toLowerCase();
+                    if (parentText.includes('source container') || parentText.includes('change container')) {
+                        console.log('[Poirot] Found container ID via parent context: ' + text);
+                        return text;
+                    }
+                }
+            }
+        }
+        // Approach 3: Just find any valid csX on the page (only on scan page)
+        if (isScanPage()) {
+            for (const el of allEls) {
+                const text = el.textContent.trim();
+                if (isValidContainerId(text) && text.length < 20) {
+                    console.log('[Poirot] Found container ID via broad scan: ' + text);
+                    return text;
+                }
+            }
+        }
+        return null;
     }
 
     function showFBALabelPopup() {
@@ -889,19 +937,29 @@
         if (checkForFCData()) return;
         if (waitingForFC) return;
 
-        if (isSidelineApp() && isScanPage() && hasSuccessBanner()) { handleSidelineSuccess(); return; }
+        // Debug logging
+        const onScan = isScanPage();
+        const onDest = isDestinationPage();
+        const onVerify = isVerifyPage();
+        const onQty = isQuantityPage();
+        const empty = isEmptyContainer();
+        const hasBanner = hasSuccessBanner();
+        const cooldown = isInSuccessCooldown();
+        console.log('[Poirot] mainCheck — scan:' + onScan + ' dest:' + onDest + ' verify:' + onVerify + ' qty:' + onQty + ' empty:' + empty + ' banner:' + hasBanner + ' cooldown:' + cooldown + ' emptyHandled:' + emptyContainerHandled);
+
+        if (isSidelineApp() && onScan && hasBanner) { handleSidelineSuccess(); return; }
 
         // ONLY check for empty containers on the Scan Item page AND not during success cooldown
-        if (isScanPage() && !hasSuccessBanner()) {
-            const empty = isEmptyContainer();
+        if (onScan && !hasBanner) {
             const cid = getSourceContainerId();
 
             if (empty && !emptyContainerHandled) {
-                if (isInSuccessCooldown()) {
+                if (cooldown) {
                     console.log('[Poirot] Empty container during success cooldown — skipping FC lookup.');
                     return;
                 }
                 emptyContainerHandled = true;
+                console.log('[Poirot] TRIGGERING FC Research for container: ' + (cid || 'NONE — showing FBA popup'));
                 if (cid) { openFCResearch(cid); } else { showFBALabelPopup(); }
                 return;
             } else if (!empty) {
@@ -909,9 +967,9 @@
             }
         }
 
-        if (isVerifyPage()) {
+        if (onVerify) {
             if (!verifyHandled) { verifyHandled = true; setTimeout(() => { clickItemMatch(); }, DELAY_BEFORE_CONFIRM); }
-        } else if (isQuantityPage()) {
+        } else if (onQty) {
             if (!quantityHandled) {
                 quantityHandled = true;
                 settings = getSettings();
@@ -931,11 +989,11 @@
                     if (!fillQuantityFromFC()) setTimeout(() => { clickItemMatch(); }, DELAY_BEFORE_CONFIRM);
                 }
             }
-        } else if (isDestinationPage()) {
+        } else if (onDest) {
             verifyHandled = false; quantityHandled = false; attachDestinationPasteListener();
-        } else if (isScanPage()) {
+        } else if (onScan) {
             verifyHandled = false; quantityHandled = false; destinationListenerAttached = false;
-            if (!hasSuccessBanner()) sidelineSuccessHandled = false;
+            if (!hasBanner) sidelineSuccessHandled = false;
             attemptAutoFill();
         } else {
             verifyHandled = false; quantityHandled = false; destinationListenerAttached = false; sidelineSuccessHandled = false;
@@ -955,6 +1013,6 @@
     observer.observe(document.body, { childList: true, subtree: true, characterData: true });
     setTimeout(mainCheck, 1500);
 
-    console.log('[Poirot Auto-Enter] v32.0 loaded — FC lookup on Scan Item page only, with 5s success cooldown.');
+    console.log('[Poirot Auto-Enter] v32.1 loaded — robust empty detection + debug logging.');
 })();
 
