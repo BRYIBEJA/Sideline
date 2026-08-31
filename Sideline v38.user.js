@@ -2,8 +2,8 @@
 // ==UserScript==
 // @name         Poirot V3 - Auto Fill FNSKU & Auto Confirm
 // @namespace    http://tampermonkey.net/
-// @version      32.4
-// @description  Full Poirot V3 automation + FC Research. Find SSCC by heading text. Settings menu. Shadow DOM aware.
+// @version      33.4
+// @description  Split-table SSCC fix (headers table + data table). GM_setValue cross-tab. Settings menu.
 // @match        https://aft-poirot-website.na.aftx.amazonoperations.app/?tool=V3*
 // @match        https://aft-poirot-website.na.aftx.amazonoperations.app/*tool=V3*
 // @match        https://aft-poirot-website.na.aftx.amazonoperations.app/*
@@ -11,7 +11,8 @@
 // @match        https://aft-poirot-website-iad.iad.proxy.amazon.com/*tool=V3*
 // @match        https://aft-poirot-website-iad.iad.proxy.amazon.com/*
 // @match        https://qifcr.na.aftx.amazonoperations.app/*
-// @grant        none
+// @grant        GM_setValue
+// @grant        GM_getValue
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -19,1159 +20,686 @@
     'use strict';
 
     // =============================================
-    // USER SETTINGS (persisted in localStorage)
+    // CROSS-TAB DATA — GM_setValue
     // =============================================
-    const SETTINGS_KEY = 'poirot_v3_settings';
-
-    function getSettings() {
-        try {
-            const raw = localStorage.getItem(SETTINGS_KEY);
-            if (raw) return JSON.parse(raw);
-        } catch(e) {}
-        return { autoQuantity: true };
+    var useGM = (typeof GM_setValue === 'function' && typeof GM_getValue === 'function');
+    function setData(key, val) {
+        if (useGM) { try { GM_setValue(key, String(val)); return; } catch(e) {} }
+        try { localStorage.setItem(key, val); } catch(e) {}
+    }
+    function getData(key) {
+        if (useGM) { try { var v = GM_getValue(key, ''); return v || ''; } catch(e) {} }
+        try { var v2 = localStorage.getItem(key); return v2 || ''; } catch(e) {}
+        return '';
+    }
+    function clearData(key) {
+        if (useGM) { try { GM_setValue(key, ''); } catch(e) {} }
+        try { localStorage.removeItem(key); } catch(e) {}
     }
 
-    function saveSettings(settings) {
-        try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch(e) {}
-    }
+    var SETTINGS_KEY = 'poirot_v3_settings';
+    function getSettings() { try { var r = localStorage.getItem(SETTINGS_KEY); if (r) return JSON.parse(r); } catch(e) {} return { autoQuantity: true }; }
+    function saveSettings(s) { try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(s)); } catch(e) {} }
+    var settings = getSettings();
 
-    let settings = getSettings();
+    function isValidCid(id) { return id && /^cs[A-Za-z][A-Za-z0-9]+$/i.test(id.trim()); }
+    function buildUrl(s) { return 'https://qifcr.na.aftx.amazonoperations.app/KRB3/results?s=' + encodeURIComponent(s); }
 
-    // =============================================
-    // SHARED: Cookie helpers
-    // =============================================
-    function setCrossCookie(name, value) {
-        document.cookie = name + '=' + encodeURIComponent(value) + '; path=/; max-age=300';
-        try { document.cookie = name + '=' + encodeURIComponent(value) + '; path=/; domain=.amazonoperations.app; max-age=300'; } catch(e) {}
-        try { document.cookie = name + '=' + encodeURIComponent(value) + '; path=/; domain=.amazon.com; max-age=300'; } catch(e) {}
+    function isValidASIN(val) {
+        if (!val) return false;
+        val = val.trim();
+        if (val.length !== 10) return false;
+        if (!/^[A-Z0-9]{10}$/i.test(val)) return false;
+        if (/^\d+$/.test(val)) return false;
+        return true;
     }
-    function getCrossCookie(name) {
-        const m = document.cookie.match(new RegExp('(?:^|; )' + name + '=([^;]*)'));
-        return m ? decodeURIComponent(m[1]) : null;
-    }
-    function clearCrossCookie(name) {
-        document.cookie = name + '=; path=/; max-age=0';
-        try { document.cookie = name + '=; path=/; domain=.amazonoperations.app; max-age=0'; } catch(e) {}
-        try { document.cookie = name + '=; path=/; domain=.amazon.com; max-age=0'; } catch(e) {}
-    }
-
-    function isValidContainerId(id) {
-        return id && /^cs[A-Za-z][A-Za-z0-9]+$/i.test(id.trim());
-    }
-
-    function buildFCResultsUrl(searchValue) {
-        return 'https://qifcr.na.aftx.amazonoperations.app/KRB3/results?s=' + encodeURIComponent(searchValue);
-    }
-
-    // =============================================
-    // DEEP TEXT SEARCH (pierces Shadow DOM)
-    // =============================================
-    function deepTextSearch(root, searchText) {
-        if (!root) return false;
-        const lower = searchText.toLowerCase();
-        if (root.nodeType === Node.TEXT_NODE) {
-            return root.textContent.toLowerCase().includes(lower);
-        }
-        if (root.textContent && root.textContent.toLowerCase().includes(lower)) return true;
-        if (root.shadowRoot) {
-            if (deepTextSearch(root.shadowRoot, searchText)) return true;
-        }
-        const children = root.childNodes || root.children || [];
-        for (const child of children) {
-            if (deepTextSearch(child, searchText)) return true;
-        }
-        return false;
-    }
-
-    function deepFindText(searchText) {
-        return deepTextSearch(document.body, searchText);
+    function isValidQty(val) {
+        if (!val) return false;
+        var n = parseInt(val, 10);
+        return !isNaN(n) && n > 0 && n <= 9999;
     }
 
     // =============================================
     // FC RESEARCH PAGE
     // =============================================
     if (window.location.hostname.includes('qifcr.na.aftx.amazonoperations.app')) {
-        const params = new URLSearchParams(window.location.search);
-        const containerId = params.get('autoSearch');
+        var params = new URLSearchParams(window.location.search);
+        if (params.get('autoSearch')) { window.location.replace(buildUrl(params.get('autoSearch'))); return; }
 
-        if (containerId) {
-            window.location.replace(buildFCResultsUrl(containerId));
-            return;
-        }
+        var attempts = 0, MAX = 25, SDELAY = 1500, done = false, bestAsin = null, bestQty = null;
 
-        let scrapeAttempts = 0;
-        const MAX_SCRAPE_ATTEMPTS = 20;
-        const SCRAPE_RETRY_DELAY = 1500;
-        let scrapeDone = false;
-        let foundAsin = null;
-        let foundQuantity = null;
-
-        // =============================================
-        // FIND SSCC SECTION — Multiple strategies
-        // =============================================
-        function findSSCCSection() {
-            // Strategy 1: data-section-type attribute
-            let section = document.querySelector('[data-section-type="sscc-info"]');
-            if (section) {
-                console.log('[Poirot] SSCC found via data-section-type="sscc-info"');
-                return section;
-            }
-
-            section = document.querySelector('[data-section-type="sscc"]');
-            if (section) {
-                console.log('[Poirot] SSCC found via data-section-type="sscc"');
-                return section;
-            }
-
-            // Strategy 2: Find heading text "SSCC" and get parent section
-            const allHeadings = document.querySelectorAll('span, h1, h2, h3, h4, h5, h6, div, label, th, td, p');
-            for (const el of allHeadings) {
-                const text = el.textContent.trim().toLowerCase();
-                // Match "sscc information", "sscc info", or just "sscc" as a heading
-                if (text === 'sscc information' || text === 'sscc info' || text === 'sscc') {
-                    // Walk up to find the containing section/div
-                    let parent = el.parentElement;
-                    for (let i = 0; i < 5 && parent; i++) {
-                        // Check if this parent has a table inside it
-                        const table = parent.querySelector('table');
-                        if (table) {
-                            console.log('[Poirot] SSCC found via heading text "' + el.textContent.trim() + '" → parent with table');
-                            return parent;
-                        }
-                        parent = parent.parentElement;
-                    }
-                    // If no table found in parents, return the closest section-like container
-                    let container = el.closest('section') || el.closest('[class*="section"]') || el.closest('[data-section-type]') || el.parentElement;
-                    if (container) {
-                        console.log('[Poirot] SSCC found via heading text "' + el.textContent.trim() + '" → closest container');
-                        return container;
-                    }
-                }
-            }
-
-            // Strategy 3: Find by section-nav ID
-            const ssccNav = document.getElementById('sscc-info') || document.getElementById('sscc-information') || document.getElementById('sscc');
-            if (ssccNav) {
-                let parent = ssccNav.parentElement;
-                for (let i = 0; i < 5 && parent; i++) {
-                    const table = parent.querySelector('table');
-                    if (table) {
-                        console.log('[Poirot] SSCC found via #sscc-info/sscc ID → parent with table');
-                        return parent;
-                    }
-                    parent = parent.parentElement;
-                }
-            }
-
-            // Strategy 4: Find section-placeholder with sscc
-            const placeholders = document.querySelectorAll('[class*="section-placeholder"]');
-            for (const ph of placeholders) {
-                const dt = ph.getAttribute('data-section-type') || '';
-                if (dt.toLowerCase().includes('sscc')) {
-                    console.log('[Poirot] SSCC found via section-placeholder data-section-type: ' + dt);
-                    return ph;
-                }
-            }
-
-            console.log('[Poirot] SSCC section NOT found by any strategy.');
-            return null;
-        }
-
-        function isInventoryHistoryEmpty() {
-            const section = document.querySelector('[data-section-type="inventory-history"]');
-            if (section) {
-                const text = section.textContent.trim().toLowerCase();
-                if (/no matching records/i.test(text)) return true;
-                if (/showing\s+0\s+to\s+0\s+of\s+0/i.test(text)) return true;
-            }
-            // Also try finding by heading text
-            const allEls = document.querySelectorAll('span, h1, h2, h3, h4, h5, h6');
-            for (const el of allEls) {
-                if (el.textContent.trim().toLowerCase() === 'inventory history') {
-                    let parent = el.parentElement;
-                    for (let i = 0; i < 5 && parent; i++) {
-                        const text = parent.textContent.trim().toLowerCase();
-                        if (/no matching records/i.test(text) || /showing\s+0\s+to\s+0\s+of\s+0/i.test(text)) return true;
-                        parent = parent.parentElement;
-                    }
-                }
-            }
-            const invTable = document.getElementById('table-inventory-history');
-            if (!invTable) return section ? true : null;
-            const tbody = invTable.querySelector('tbody');
-            if (tbody) {
-                const text = tbody.textContent.trim().toLowerCase();
-                if (text.includes('no matching records') || text.includes('no data') || text.includes('no results')) return true;
-                const rows = tbody.querySelectorAll('tr');
+        function isInvHistEmpty() {
+            var sec = document.querySelector('[data-section-type="inventory-history"]');
+            if (sec) { var t = sec.textContent.toLowerCase(); if (/no matching records/i.test(t) || /showing\s+0\s+to\s+0/i.test(t)) return true; }
+            var tbl = document.getElementById('table-inventory-history');
+            if (!tbl) return sec ? true : null;
+            var tb = tbl.querySelector('tbody');
+            if (tb) {
+                var bt = tb.textContent.toLowerCase();
+                if (bt.includes('no matching') || bt.includes('no data')) return true;
+                var rows = tb.querySelectorAll('tr');
                 if (rows.length === 0) return true;
-                if (rows.length === 1) {
-                    const cells = rows[0].querySelectorAll('td');
-                    if (cells.length <= 1) {
-                        const cellText = cells[0] ? cells[0].textContent.trim().toLowerCase() : '';
-                        if (cellText.includes('no matching') || cellText.includes('no data') || cellText === '') return true;
-                    }
-                }
+                if (rows.length === 1 && rows[0].querySelectorAll('td').length <= 1) return true;
             }
             return false;
         }
 
-        function scrapeFromInventoryHistory() {
-            let asin = null, quantity = null;
-            const section = document.querySelector('[data-section-type="inventory-history"]');
-            let invTable = null;
-            if (section) invTable = section.querySelector('table');
-            if (!invTable) invTable = document.getElementById('table-inventory-history');
-            if (!invTable) return { asin: null, quantity: null };
-
-            const firstRow = invTable.querySelector('tbody tr');
-            if (!firstRow) return { asin: null, quantity: null };
-
-            const asinLink = firstRow.querySelector('a[href*="/results"]');
-            if (asinLink) asin = asinLink.textContent.trim();
-
-            const headers = Array.from(invTable.querySelectorAll('thead th')).map(th => th.textContent.trim().toLowerCase());
-            const cells = firstRow.querySelectorAll('td');
-            const qtyIdx = headers.findIndex(h => h.includes('quantity') || h.includes('qty'));
-            if (qtyIdx >= 0 && cells[qtyIdx]) {
-                const qm = cells[qtyIdx].textContent.trim().match(/(\d+)/);
-                if (qm) quantity = qm[1];
-            }
-            if (!quantity) {
-                for (const cell of cells) {
-                    const text = cell.textContent.trim();
-                    if (/^\d+$/.test(text) && text !== '0') { quantity = text; break; }
-                }
-            }
-            return { asin, quantity };
+        function scrapeInvHist() {
+            var asin = null, qty = null;
+            var sec = document.querySelector('[data-section-type="inventory-history"]');
+            var tbl = sec ? sec.querySelector('table') : null;
+            if (!tbl) tbl = document.getElementById('table-inventory-history');
+            if (!tbl) return { asin: null, quantity: null };
+            var row = tbl.querySelector('tbody tr');
+            if (!row) return { asin: null, quantity: null };
+            var link = row.querySelector('a[href*="/results"]');
+            if (link) { var v = link.textContent.trim(); if (isValidASIN(v)) asin = v; }
+            var ths = Array.from(tbl.querySelectorAll('thead th')).map(function(th) { return th.textContent.trim().toLowerCase(); });
+            var tds = row.querySelectorAll('td');
+            var qi = ths.findIndex(function(h) { return h.includes('quantity') || h.includes('qty'); });
+            if (qi >= 0 && tds[qi]) { var qm = tds[qi].textContent.trim().match(/(\d+)/); if (qm && isValidQty(qm[1])) qty = qm[1]; }
+            return { asin: asin, quantity: qty };
         }
 
-        function scrapeFromSSCC() {
-            let asin = null, quantity = null;
+        // =============================================
+        // SSCC SCRAPER — handles split tables
+        // Table 1 = headers only (ASIN, Quantity, Title)
+        // Table 2 = data only (empty TH + TD rows)
+        // =============================================
+        function scrapeSSCC() {
+            var asin = null, qty = null;
+            console.log('[Poirot] === SSCC Scraper Start ===');
 
-            const ssccSection = findSSCCSection();
-            if (!ssccSection) {
-                return { asin: null, quantity: null };
-            }
-
-            const sectionText = ssccSection.textContent;
-            console.log('[Poirot] SSCC section text (first 500 chars): ' + sectionText.substring(0, 500));
-
-            // ---- APPROACH A: Table-based scraping ----
-            const table = ssccSection.querySelector('table');
-            if (table) {
-                const allRows = Array.from(table.querySelectorAll('tr'));
-                console.log('[Poirot] SSCC table has ' + allRows.length + ' rows');
-
-                for (let r = 0; r < allRows.length; r++) {
-                    const cells = allRows[r].querySelectorAll('td, th');
-                    const vals = Array.from(cells).map(c => c.textContent.trim().substring(0, 60));
-                    console.log('[Poirot] SSCC row ' + r + ': ' + JSON.stringify(vals));
-                }
-
-                let headers = [];
-                let dataRows = [];
-
-                const theadThs = table.querySelectorAll('thead th');
-                if (theadThs.length > 0) {
-                    headers = Array.from(theadThs).map(th => th.textContent.trim().toLowerCase());
-                    dataRows = Array.from(table.querySelectorAll('tbody tr'));
-                    if (dataRows.length === 0) {
-                        dataRows = allRows.filter(row => !row.closest('thead'));
+            var sec = document.querySelector('[data-section-type="sscc-info"]');
+            if (!sec) {
+                var allEls = document.querySelectorAll('span, h1, h2, h3, h4, h5, h6, div');
+                for (var h = 0; h < allEls.length; h++) {
+                    var ht = allEls[h].textContent.trim().toLowerCase();
+                    if (ht === 'sscc information' || ht === 'sscc info') {
+                        sec = allEls[h].closest('[data-section-type]') || allEls[h].closest('section');
+                        if (!sec) { var p = allEls[h].parentElement; for (var w = 0; w < 10 && p; w++) { if (p.querySelector('table')) { sec = p; break; } p = p.parentElement; } }
+                        if (sec) break;
                     }
-                }
-
-                if (headers.length === 0 && allRows.length > 0) {
-                    const firstThs = allRows[0].querySelectorAll('th');
-                    if (firstThs.length > 0) {
-                        headers = Array.from(firstThs).map(th => th.textContent.trim().toLowerCase());
-                        dataRows = allRows.slice(1);
-                    }
-                }
-
-                if (headers.length === 0 && allRows.length > 1) {
-                    const firstCells = allRows[0].querySelectorAll('td');
-                    headers = Array.from(firstCells).map(td => td.textContent.trim().toLowerCase());
-                    dataRows = allRows.slice(1);
-                }
-
-                console.log('[Poirot] SSCC headers: ' + JSON.stringify(headers));
-
-                const asinIdx = headers.findIndex(h => h === 'asin' || h.includes('asin'));
-                const qtyIdx = headers.findIndex(h =>
-                    h === 'quantity' || h === 'qty' ||
-                    h.includes('quantity') || h.includes('qty')
-                );
-                console.log('[Poirot] SSCC asinIdx=' + asinIdx + ', qtyIdx=' + qtyIdx);
-
-                for (const row of dataRows) {
-                    const cells = row.querySelectorAll('td');
-                    const rowText = row.textContent.trim().toLowerCase();
-                    if (rowText.includes('no matching') || rowText.includes('no data') || rowText.includes('showing 0')) continue;
-                    if (cells.length === 0) continue;
-
-                    if (asinIdx >= 0 && asinIdx < cells.length) {
-                        const link = cells[asinIdx].querySelector('a');
-                        const val = link ? link.textContent.trim() : cells[asinIdx].textContent.trim();
-                        if (val && val.length > 0 && val !== '-') asin = val;
-                    }
-
-                    if (qtyIdx >= 0 && qtyIdx < cells.length) {
-                        const raw = cells[qtyIdx].textContent.trim();
-                        const qm = raw.match(/(\d+)/);
-                        if (qm) quantity = qm[1];
-                        console.log('[Poirot] SSCC qty cell [idx ' + qtyIdx + '] raw: "' + raw + '" → qty: ' + quantity);
-                    }
-
-                    if (!asin) {
-                        for (const cell of cells) {
-                            const link = cell.querySelector('a');
-                            const val = link ? link.textContent.trim() : cell.textContent.trim();
-                            if (/^[A-Z0-9]{10}$/.test(val)) { asin = val; break; }
-                        }
-                    }
-
-                    if (asin && !quantity) {
-                        for (let i = 0; i < cells.length; i++) {
-                            if (i === asinIdx) continue;
-                            const text = cells[i].textContent.trim();
-                            if (/^\d+$/.test(text) && text !== '0') { quantity = text; break; }
-                        }
-                    }
-
-                    if (asin) break;
                 }
             }
 
-            // ---- APPROACH B: Text-based regex on section text ----
-            if (!asin || !quantity) {
-                console.log('[Poirot] Table approach incomplete (ASIN: ' + asin + ', Qty: ' + quantity + '). Trying text regex...');
+            if (!sec) { console.log('[Poirot] SSCC section NOT found'); return { asin: null, quantity: null }; }
+            console.log('[Poirot] SSCC section found: ' + sec.tagName + '.' + (sec.className || '').substring(0, 50));
 
-                if (!asin) {
-                    const asinLabelMatch = sectionText.match(/ASIN[:\s]+([A-Z0-9]{10})/i);
-                    if (asinLabelMatch) {
-                        asin = asinLabelMatch[1];
-                        console.log('[Poirot] SSCC text ASIN (label match): ' + asin);
+            var tables = sec.querySelectorAll('table');
+            console.log('[Poirot] SSCC tables found: ' + tables.length);
+
+            // Strategy: find the header table (has ASIN/Quantity TH) and the data table (next one)
+            var headerCols = null; // { ai: index, qi: index }
+            var dataTable = null;
+
+            for (var t = 0; t < tables.length; t++) {
+                var tbl = tables[t];
+
+                // Get all TH text from this table
+                var allTH = Array.from(tbl.querySelectorAll('th')).map(function(th) { return th.textContent.trim().toLowerCase(); });
+                // Get all TD elements
+                var allTD = tbl.querySelectorAll('td');
+
+                console.log('[Poirot] Table #' + t + ' TH: ' + JSON.stringify(allTH) + ' TD count: ' + allTD.length);
+
+                var ai = allTH.findIndex(function(x) { return x === 'asin' || x.includes('asin'); });
+                var qi = allTH.findIndex(function(x) { return x === 'quantity' || x === 'qty' || x.includes('quantity') || x.includes('qty'); });
+
+                // Case A: Table has ASIN header AND has TD data rows → complete table
+                if (ai >= 0) {
+                    // Check if this table has actual TD data
+                    var dataRows = Array.from(tbl.querySelectorAll('tr')).filter(function(row) {
+                        return row.querySelectorAll('td').length > 0;
+                    });
+
+                    if (dataRows.length > 0) {
+                        // Complete table — headers and data in same table
+                        console.log('[Poirot] Table #' + t + ' — complete table with ASIN col=' + ai + ' Qty col=' + qi);
+                        for (var r = 0; r < dataRows.length; r++) {
+                            var cells = dataRows[r].querySelectorAll('td');
+                            var rv = Array.from(cells).map(function(c) { return c.textContent.trim().substring(0, 50); });
+                            console.log('[Poirot] Table #' + t + ' data row ' + r + ': ' + JSON.stringify(rv));
+
+                            if (ai < cells.length) {
+                                var val = cells[ai].textContent.trim();
+                                var lnk = cells[ai].querySelector('a');
+                                if (lnk) val = lnk.textContent.trim();
+                                if (isValidASIN(val)) asin = val;
+                            }
+                            if (qi >= 0 && qi < cells.length) {
+                                var raw = cells[qi].textContent.trim();
+                                if (/^\d+$/.test(raw) && isValidQty(raw)) qty = raw;
+                            }
+                            if (asin) break;
+                        }
+                    } else {
+                        // Header-only table — save column positions, data is in next table
+                        console.log('[Poirot] Table #' + t + ' — header-only (ASIN col=' + ai + ' Qty col=' + qi + ')');
+                        headerCols = { ai: ai, qi: qi };
                     }
-                    if (!asin) {
-                        const asinPatterns = sectionText.match(/\b([A-Z0-9]{10})\b/g);
-                        if (asinPatterns) {
-                            for (const candidate of asinPatterns) {
-                                if (/^\d{10}$/.test(candidate)) continue;
-                                if (/^[A-Z][A-Z0-9]{9}$/.test(candidate)) { asin = candidate; break; }
+                }
+
+                // Case B: Table has no meaningful headers but has TD data — check if previous table had headers
+                if (ai < 0 && headerCols && allTD.length > 0) {
+                    dataTable = tbl;
+                    console.log('[Poirot] Table #' + t + ' — using as data table for previous headers');
+
+                    var dRows = Array.from(tbl.querySelectorAll('tr')).filter(function(row) {
+                        return row.querySelectorAll('td').length > 0;
+                    });
+
+                    for (var r2 = 0; r2 < dRows.length; r2++) {
+                        var cells2 = dRows[r2].querySelectorAll('td');
+                        var rv2 = Array.from(cells2).map(function(c) { return c.textContent.trim().substring(0, 50); });
+                        console.log('[Poirot] Data row ' + r2 + ': ' + JSON.stringify(rv2));
+
+                        if (headerCols.ai >= 0 && headerCols.ai < cells2.length) {
+                            var val2 = cells2[headerCols.ai].textContent.trim();
+                            var lnk2 = cells2[headerCols.ai].querySelector('a');
+                            if (lnk2) val2 = lnk2.textContent.trim();
+                            console.log('[Poirot] ASIN candidate: "' + val2 + '" valid: ' + isValidASIN(val2));
+                            if (isValidASIN(val2)) asin = val2;
+                        }
+                        if (headerCols.qi >= 0 && headerCols.qi < cells2.length) {
+                            var raw2 = cells2[headerCols.qi].textContent.trim();
+                            console.log('[Poirot] Qty candidate: "' + raw2 + '" valid: ' + isValidQty(raw2));
+                            if (/^\d+$/.test(raw2) && isValidQty(raw2)) qty = raw2;
+                        }
+
+                        // Fallback: scan cells
+                        if (!asin) {
+                            for (var c = 0; c < cells2.length; c++) {
+                                var cv = cells2[c].textContent.trim();
+                                if (isValidASIN(cv)) { asin = cv; console.log('[Poirot] ASIN fallback cell ' + c + ': ' + cv); break; }
                             }
                         }
+                        if (asin && !qty) {
+                            for (var c2 = 0; c2 < cells2.length; c2++) {
+                                var tx = cells2[c2].textContent.trim();
+                                if (/^\d+$/.test(tx) && isValidQty(tx)) { qty = tx; console.log('[Poirot] Qty fallback cell ' + c2 + ': ' + tx); break; }
+                            }
+                        }
+                        if (asin) break;
                     }
                 }
 
-                if (!quantity) {
-                    const qtyLabelMatch = sectionText.match(/Quantity[:\s]+(\d+)/i);
-                    if (qtyLabelMatch) {
-                        quantity = qtyLabelMatch[1];
-                        console.log('[Poirot] SSCC text Qty (label match): ' + quantity);
-                    }
+                if (asin) break;
+            }
+
+            // Text fallback
+            if (!asin || !qty) {
+                var secText = sec.textContent;
+                console.log('[Poirot] SSCC text fallback (500 chars): ' + secText.substring(0, 500));
+                if (!asin) {
+                    var am = secText.match(/ASIN[\s:]*([A-Z0-9]{10})/i);
+                    if (am && isValidASIN(am[1])) { asin = am[1]; console.log('[Poirot] ASIN from text: ' + asin); }
+                }
+                if (!asin) {
+                    var allM = secText.match(/[A-Z][A-Z0-9]{9}/g);
+                    if (allM) { for (var x = 0; x < allM.length; x++) { if (isValidASIN(allM[x])) { asin = allM[x]; console.log('[Poirot] ASIN from text scan: ' + asin); break; } } }
+                }
+                if (!qty) {
+                    var qm = secText.match(/Quantity[\s:]*(\d+)/i);
+                    if (qm && isValidQty(qm[1])) { qty = qm[1]; console.log('[Poirot] Qty from text: ' + qty); }
+                }
+                if (asin && !qty) {
+                    var idx = secText.indexOf(asin);
+                    if (idx >= 0) { var after = secText.substring(idx + asin.length, idx + asin.length + 50); var qm2 = after.match(/(\d+)/); if (qm2 && isValidQty(qm2[1])) { qty = qm2[1]; console.log('[Poirot] Qty after ASIN: ' + qty); } }
                 }
             }
 
-            // ---- APPROACH C: Cell-walk for labeled pairs ----
-            if (!asin || !quantity) {
-                console.log('[Poirot] Trying cell-walk approach...');
-                const allElements = ssccSection.querySelectorAll('td, th, span, div, p, label, dt, dd');
-                let nextIsAsin = false;
-                let nextIsQty = false;
-
-                for (const el of allElements) {
-                    const text = el.textContent.trim();
-                    const lower = text.toLowerCase();
-
-                    if (lower === 'asin' || lower === 'asin:') { nextIsAsin = true; continue; }
-                    if (lower === 'quantity' || lower === 'quantity:' || lower === 'qty' || lower === 'qty:') { nextIsQty = true; continue; }
-
-                    if (nextIsAsin && !asin) {
-                        const link = el.querySelector ? el.querySelector('a') : null;
-                        const val = link ? link.textContent.trim() : text;
-                        if (/^[A-Z0-9]{10}$/.test(val)) {
-                            asin = val;
-                            console.log('[Poirot] SSCC cell-walk ASIN: ' + asin);
-                        }
-                        nextIsAsin = false;
-                    }
-
-                    if (nextIsQty && !quantity) {
-                        const qm = text.match(/^(\d+)$/);
-                        if (qm) {
-                            quantity = qm[1];
-                            console.log('[Poirot] SSCC cell-walk Qty: ' + quantity);
-                        }
-                        nextIsQty = false;
-                    }
-                }
-            }
-
-            console.log('[Poirot] SSCC FINAL — ASIN: ' + (asin || 'null') + ', Qty: ' + (quantity || 'null'));
-            return { asin, quantity };
+            console.log('[Poirot] === SSCC Result: ASIN=' + (asin || 'null') + ', Qty=' + (qty || 'null') + ' ===');
+            return { asin: asin, quantity: qty };
         }
 
         function scrapeAndSend() {
-            if (scrapeDone) return;
-            scrapeAttempts++;
+            if (done) return;
+            attempts++;
+            var asin = null, qty = null;
 
-            let asin = null, quantity = null;
-
-            // Try Inventory History first
-            const invEmpty = isInventoryHistoryEmpty();
-            if (invEmpty === false) {
-                const invData = scrapeFromInventoryHistory();
-                asin = invData.asin;
-                quantity = invData.quantity;
-                console.log('[Poirot] InvHist (attempt ' + scrapeAttempts + ') — ASIN: ' + asin + ', Qty: ' + quantity);
+            if (isInvHistEmpty() === false) {
+                var inv = scrapeInvHist();
+                if (inv.asin) asin = inv.asin;
+                if (inv.quantity) qty = inv.quantity;
+                if (asin) console.log('[Poirot] InvHist: ASIN=' + asin + ' Qty=' + (qty || 'null'));
             }
 
-            // Try SSCC
-            if (!asin || !quantity) {
-                const ssccData = scrapeFromSSCC();
-                if (ssccData.asin) asin = ssccData.asin;
-                if (ssccData.quantity) quantity = ssccData.quantity;
+            if (!asin || !qty) {
+                var sscc = scrapeSSCC();
+                if (sscc.asin) asin = sscc.asin;
+                if (sscc.quantity) qty = sscc.quantity;
             }
 
-            // Persist best results across retries
-            if (asin) foundAsin = asin;
-            if (quantity) foundQuantity = quantity;
+            if (asin && isValidASIN(asin)) bestAsin = asin;
+            if (qty && isValidQty(qty)) bestQty = qty;
 
-            console.log('[Poirot] Attempt ' + scrapeAttempts + '/' + MAX_SCRAPE_ATTEMPTS + ' — Best ASIN: ' + (foundAsin || 'null') + ', Best Qty: ' + (foundQuantity || 'null'));
+            console.log('[Poirot] Attempt ' + attempts + '/' + MAX + ' — Best: ASIN=' + (bestAsin || 'null') + ', Qty=' + (bestQty || 'null'));
 
-            // SUCCESS: Both found
-            if (foundAsin && foundQuantity) {
-                scrapeDone = true;
-                setCrossCookie('poirot_fc_asin', foundAsin);
-                setCrossCookie('poirot_fc_quantity', foundQuantity);
-                setCrossCookie('poirot_fc_ready', 'true');
-                console.log('[Poirot] SUCCESS — ASIN: ' + foundAsin + ', Qty: ' + foundQuantity);
-                setTimeout(() => { window.close(); }, 500);
+            if (bestAsin && bestQty) {
+                done = true;
+                setData('poirot_fc_asin', bestAsin);
+                setData('poirot_fc_quantity', bestQty);
+                setData('poirot_fc_ready', 'true');
+                console.log('[Poirot] SUCCESS — ASIN: ' + bestAsin + ', Qty: ' + bestQty);
+                setTimeout(function() { window.close(); }, 500);
                 return;
             }
 
-            // Keep retrying
-            if (scrapeAttempts < MAX_SCRAPE_ATTEMPTS) {
-                setTimeout(scrapeAndSend, SCRAPE_RETRY_DELAY);
-                return;
-            }
+            if (attempts < MAX) { setTimeout(scrapeAndSend, SDELAY); return; }
 
-            // MAX ATTEMPTS REACHED
-            scrapeDone = true;
-
-            if (foundAsin) {
-                setCrossCookie('poirot_fc_asin', foundAsin);
-                if (foundQuantity) setCrossCookie('poirot_fc_quantity', foundQuantity);
-                setCrossCookie('poirot_fc_ready', 'true');
-                console.log('[Poirot] MAX ATTEMPTS — sending ASIN: ' + foundAsin + ', Qty: ' + (foundQuantity || 'NOT FOUND'));
-                setTimeout(() => { window.close(); }, 500);
+            done = true;
+            if (bestAsin) {
+                setData('poirot_fc_asin', bestAsin);
+                if (bestQty) setData('poirot_fc_quantity', bestQty);
+                setData('poirot_fc_ready', 'true');
             } else {
-                setCrossCookie('poirot_fc_empty', 'true');
-                console.log('[Poirot] MAX ATTEMPTS — no data found, signaling empty.');
-                setTimeout(() => { window.close(); }, 500);
+                setData('poirot_fc_empty', 'true');
             }
+            setTimeout(function() { window.close(); }, 500);
         }
 
-        const fcObs = new MutationObserver(() => {
-            if (scrapeDone) return;
-            setTimeout(scrapeAndSend, 1500);
-        });
-        fcObs.observe(document.body, { childList: true, subtree: true });
-
+        new MutationObserver(function() { if (!done) setTimeout(scrapeAndSend, 1500); }).observe(document.body, { childList: true, subtree: true });
         setTimeout(scrapeAndSend, 2000);
         setTimeout(scrapeAndSend, 4000);
         setTimeout(scrapeAndSend, 7000);
         setTimeout(scrapeAndSend, 10000);
         setTimeout(scrapeAndSend, 15000);
         setTimeout(scrapeAndSend, 20000);
-        setTimeout(scrapeAndSend, 25000);
-
         return;
     }
 
     // =============================================
     // SIDELINE PAGE
     // =============================================
+    var D_FILL = 500, D_ENTER = 150, D_CONFIRM = 300, D_CHANGE = 600, D_BANNER = 800, COOL_MS = 5000;
+    var lastFN = '', verifyH = false, qtyH = false, destH = false, successH = false, emptyH = false;
+    var fcDataH = false, fbaShown = false, fcEmptyH = false, waitFC = false, lastSucc = 0, lastCid = '';
 
-    const DELAY_BEFORE_FILL = 500;
-    const DELAY_BEFORE_ENTER = 150;
-    const DELAY_BEFORE_CONFIRM = 300;
-    const DELAY_BEFORE_CHANGE_CONTAINER = 600;
-    const DELAY_AFTER_SUCCESS_BANNER = 800;
-    const SUCCESS_COOLDOWN_MS = 5000;
+    function markSucc() { lastSucc = Date.now(); }
+    function inCool() { return (Date.now() - lastSucc) < COOL_MS; }
 
-    let lastFilledFNSKU = '';
-    let verifyHandled = false;
-    let quantityHandled = false;
-    let destinationListenerAttached = false;
-    let sidelineSuccessHandled = false;
-    let emptyContainerHandled = false;
-    let fcDataHandled = false;
-    let fbaPopupShown = false;
-    let fcEmptyHandled = false;
-    let waitingForFC = false;
-
-    let lastSuccessTime = 0;
-
-    function markSuccessFired() {
-        lastSuccessTime = Date.now();
-        console.log('[Poirot] Success fired — cooldown started (' + SUCCESS_COOLDOWN_MS + 'ms).');
-    }
-
-    function isInSuccessCooldown() {
-        return (Date.now() - lastSuccessTime) < SUCCESS_COOLDOWN_MS;
-    }
-
-    // =============================================
-    // PAGE DETECTION (Shadow DOM aware)
-    // =============================================
-    function findPageHeading() {
-        const selectors = 'span.text--size-xxl, h1, h2, h3, h4, h5, h6, [class*="title"], [class*="header"], [class*="heading"]';
-        const els = document.querySelectorAll(selectors);
-        for (const el of els) {
-            const t = el.textContent.replace(/\s+/g, ' ').trim().toLowerCase();
-            if (t.length > 0 && t.length < 100) return t;
+    function getVisibleHeading() {
+        var candidates = document.querySelectorAll(
+            'span.text--size-xxl, span.a-size-extra-large, main h1, main h2, main h3, ' +
+            '[class*="content"] h1, [class*="content"] h2, h1, h2, h3'
+        );
+        for (var i = 0; i < candidates.length; i++) {
+            var el = candidates[i];
+            var rect = el.getBoundingClientRect();
+            if (rect.width === 0 && rect.height === 0) continue;
+            var style = window.getComputedStyle(el);
+            if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') continue;
+            var t = el.textContent.replace(/\s+/g, ' ').trim().toLowerCase();
+            if (t.length > 0 && t.length < 120) return t;
+        }
+        var shadowEls = document.querySelectorAll('alchemy-heading, [class*="heading"], [class*="title"]');
+        for (var j = 0; j < shadowEls.length; j++) {
+            var sr = shadowEls[j].shadowRoot;
+            if (sr) { var sh = sr.querySelector('h1, h2, h3, span'); if (sh) { var st = sh.textContent.replace(/\s+/g, ' ').trim().toLowerCase(); if (st.length > 0 && st.length < 120) return st; } }
+            var rect2 = shadowEls[j].getBoundingClientRect();
+            if (rect2.width === 0 && rect2.height === 0) continue;
+            var t2 = shadowEls[j].textContent.replace(/\s+/g, ' ').trim().toLowerCase();
+            if (t2.length > 0 && t2.length < 120) return t2;
         }
         return '';
     }
 
-    function isScanPage() {
-        const heading = findPageHeading();
-        if (heading.includes('scan item')) return true;
-        if (deepFindText('Scan item')) return true;
-        const changeBtn = document.getElementById('change-container-button') ||
-            document.querySelector('[id="change-container-button"]') ||
-            document.querySelector('alchemy-button#change-container-button');
-        if (changeBtn) {
-            if (!isDestinationPage() && !isVerifyPage() && !isQuantityPage()) {
-                const bodyText = document.body.textContent.toLowerCase();
-                if (bodyText.includes('no items found') || bodyText.includes('item quantity')) return true;
-                const input = getScanInput();
-                if (input) {
-                    const placeholder = (input.placeholder || '').toLowerCase();
-                    if (placeholder.includes('scan') || placeholder === '') return true;
-                }
+    function getPageState() {
+        var h = getVisibleHeading();
+        console.log('[Poirot] heading: "' + h + '"');
+        if (h.includes('verify item') || h.includes('verify the item')) return 'verify';
+        if (h.includes('enter quantity') || h === 'quantity') return 'quantity';
+        if (h.includes('scan destination') || h.includes('destination container')) return 'destination';
+        if (h.includes('scan item') || h.includes('scan the item')) return 'scan';
+        var inp = getInput();
+        if (inp) {
+            var ph = (inp.placeholder || '').toLowerCase();
+            if (ph.includes('destination') || ph.includes('dest')) return 'destination';
+            if (ph.includes('quantity') || ph.includes('qty')) return 'quantity';
+            if (ph.includes('verify')) return 'verify';
+            if (ph.includes('scan')) return 'scan';
+        }
+        var cb = document.getElementById('change-container-button') || document.querySelector('alchemy-button#change-container-button');
+        if (cb) return 'scan';
+        return 'unknown';
+    }
+
+    function isEmp() {
+        if (getFNSKU()) return false;
+        var candidates = document.querySelectorAll('span, p, div');
+        for (var i = 0; i < candidates.length; i++) {
+            var el = candidates[i];
+            var t = el.textContent.trim().toLowerCase();
+            if (t !== 'no items found' && t !== 'no items found in this container' && t !== 'no items found in this container.') continue;
+            var rect = el.getBoundingClientRect();
+            if (rect.width === 0 && rect.height === 0) continue;
+            var style = window.getComputedStyle(el);
+            if (style.display === 'none' || style.visibility === 'hidden') continue;
+            return true;
+        }
+        return false;
+    }
+
+    function hasBan() {
+        var all = document.querySelectorAll('[class*="alert--success"], [class*="success-banner"], [class*="toast"]');
+        for (var i = 0; i < all.length; i++) {
+            var rect = all[i].getBoundingClientRect();
+            if (rect.width === 0 && rect.height === 0) continue;
+            var style = window.getComputedStyle(all[i]);
+            if (style.display === 'none' || style.visibility === 'hidden') continue;
+            if (all[i].textContent.trim().toLowerCase().includes('success')) return true;
+        }
+        return false;
+    }
+
+    function getCid() {
+        var lbl = document.getElementById('source-container-label');
+        if (lbl) { var t = lbl.textContent.trim(); if (isValidCid(t)) return t; }
+        var els = document.querySelectorAll('span, div, p, label');
+        for (var i = 0; i < els.length; i++) {
+            var t2 = els[i].textContent.trim();
+            if (isValidCid(t2)) {
+                var par = els[i].parentElement;
+                if (par) { var pt = par.textContent.toLowerCase(); if (pt.includes('source container') || pt.includes('change container')) return t2; }
             }
-        }
-        const bodyText = document.body.textContent.toLowerCase();
-        if (bodyText.includes('scan item') && !bodyText.includes('enter quantity') && !bodyText.includes('scan destination') && !bodyText.includes('verify item')) return true;
-        return false;
-    }
-
-    function isVerifyPage() {
-        const heading = findPageHeading();
-        if (heading.includes('verify item')) return true;
-        if (deepFindText('Verify item')) return true;
-        const bodyText = document.body.textContent.toLowerCase();
-        if (bodyText.includes('verify item') && !bodyText.includes('scan item')) return true;
-        return false;
-    }
-
-    function isQuantityPage() {
-        const heading = findPageHeading();
-        if (heading.includes('enter quantity')) return true;
-        if (deepFindText('Enter quantity')) return true;
-        const bodyText = document.body.textContent.toLowerCase();
-        if (bodyText.includes('enter quantity')) return true;
-        return false;
-    }
-
-    function isDestinationPage() {
-        const heading = findPageHeading();
-        if (heading.includes('scan destination') || heading.includes('destination container')) return true;
-        if (deepFindText('Scan destination')) return true;
-        if (deepFindText('Destination container')) return true;
-        const bodyText = document.body.textContent.toLowerCase();
-        if (bodyText.includes('scan destination') || bodyText.includes('destination container')) return true;
-        return false;
-    }
-
-    function isEmptyContainer() {
-        const spans = document.querySelectorAll('span.text--size-lg, span.text');
-        for (const el of spans) {
-            if (el.textContent.trim().toLowerCase().includes('no items found')) return true;
-        }
-        const bodyText = document.body.textContent.toLowerCase();
-        if (bodyText.includes('item quantity') && bodyText.includes('number of rows')) {
-            const qtyMatch = bodyText.match(/item\s*quantity[:\s]*(\d+)/i);
-            const rowMatch = bodyText.match(/number\s*of\s*rows[:\s]*(\d+)/i);
-            if (qtyMatch && rowMatch && qtyMatch[1] === '0' && rowMatch[1] === '0') return true;
-        }
-        if (bodyText.includes('no items found in this container')) return true;
-        if (deepFindText('No items found in this container')) return true;
-        return false;
-    }
-
-    function getSourceContainerId() {
-        const label = document.getElementById('source-container-label');
-        if (label) {
-            const text = label.textContent.trim();
-            if (isValidContainerId(text)) return text;
-        }
-        const allEls = document.querySelectorAll('span, div, p, label, h1, h2, h3, h4, h5, h6');
-        for (const el of allEls) {
-            const text = el.textContent.trim();
-            if (isValidContainerId(text)) {
-                const parent = el.parentElement;
-                if (parent) {
-                    const parentText = parent.textContent.toLowerCase();
-                    if (parentText.includes('source container') || parentText.includes('change container')) return text;
-                }
-            }
-        }
-        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
-        while (walker.nextNode()) {
-            const match = walker.currentNode.textContent.trim().match(/^(cs[A-Za-z][A-Za-z0-9]+)$/);
-            if (match && match[1].length < 20) return match[1];
         }
         return null;
     }
 
     // =============================================
-    // SETTINGS MENU UI
+    // SETTINGS MENU
     // =============================================
-    function createSettingsMenu() {
-        if (document.getElementById('poirot-settings-gear')) return;
-
-        const gear = document.createElement('div');
-        gear.id = 'poirot-settings-gear';
-        gear.textContent = '\u2699\uFE0F';
-        gear.title = 'Poirot V3 Settings';
+    function createMenu() {
+        if (document.getElementById('poirot-gear')) return;
+        var gear = document.createElement('div'); gear.id = 'poirot-gear'; gear.textContent = '\u2699\uFE0F'; gear.title = 'Poirot V3 Settings';
         gear.style.cssText = 'position:fixed;bottom:20px;right:20px;width:48px;height:48px;background:#232f3e;color:#ff9900;font-size:26px;line-height:48px;text-align:center;border-radius:50%;cursor:pointer;z-index:99998;box-shadow:0 2px 12px rgba(0,0,0,0.3);transition:transform 0.2s,background 0.2s;user-select:none;';
-        gear.addEventListener('mouseenter', () => { gear.style.transform = 'rotate(45deg) scale(1.1)'; gear.style.background = '#37475a'; });
-        gear.addEventListener('mouseleave', () => { gear.style.transform = 'rotate(0deg) scale(1)'; gear.style.background = '#232f3e'; });
-
-        const panel = document.createElement('div');
-        panel.id = 'poirot-settings-panel';
+        gear.addEventListener('mouseenter', function() { gear.style.transform = 'rotate(45deg) scale(1.1)'; gear.style.background = '#37475a'; });
+        gear.addEventListener('mouseleave', function() { gear.style.transform = 'rotate(0deg) scale(1)'; gear.style.background = '#232f3e'; });
+        var panel = document.createElement('div'); panel.id = 'poirot-panel';
         panel.style.cssText = 'position:fixed;bottom:80px;right:20px;width:300px;background:#fff;border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,0.25);z-index:99999;overflow:hidden;display:none;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;transition:opacity 0.2s,transform 0.2s;transform:translateY(10px);opacity:0;';
-
-        const header = document.createElement('div');
-        header.style.cssText = 'background:#232f3e;color:#fff;padding:16px 20px;display:flex;align-items:center;justify-content:space-between;';
-        const headerTitle = document.createElement('span');
-        headerTitle.textContent = '\u2699\uFE0F Poirot V3 Settings';
-        headerTitle.style.cssText = 'font-size:16px;font-weight:bold;';
-        const headerVersion = document.createElement('span');
-        headerVersion.textContent = 'v32.4';
-        headerVersion.style.cssText = 'font-size:12px;color:#ff9900;background:#37475a;padding:2px 8px;border-radius:10px;';
-        header.appendChild(headerTitle);
-        header.appendChild(headerVersion);
-
-        const body = document.createElement('div');
-        body.style.cssText = 'padding:16px 20px;';
-
-        const autoQtyRow = createToggleRow(
-            'Auto Enter Quantity',
-            'Automatically fills and confirms the quantity on the quantity page.',
-            settings.autoQuantity,
-            (checked) => {
-                settings.autoQuantity = checked;
-                saveSettings(settings);
-            }
-        );
-        body.appendChild(autoQtyRow);
-
-        const divider = document.createElement('div');
-        divider.style.cssText = 'height:1px;background:#eee;margin:12px 0;';
-        body.appendChild(divider);
-
-        const statusRow = document.createElement('div');
-        statusRow.style.cssText = 'display:flex;align-items:center;justify-content:space-between;';
-        const statusLabel = document.createElement('span');
-        statusLabel.textContent = 'Script Status';
-        statusLabel.style.cssText = 'font-size:13px;color:#555;';
-        const statusBadge = document.createElement('span');
-        statusBadge.textContent = '\u2705 Active';
-        statusBadge.style.cssText = 'font-size:12px;color:#067d06;background:#e6f9e6;padding:3px 10px;border-radius:10px;font-weight:600;';
-        statusRow.appendChild(statusLabel);
-        statusRow.appendChild(statusBadge);
-        body.appendChild(statusRow);
-
-        panel.appendChild(header);
-        panel.appendChild(body);
-
-        let panelOpen = false;
-        gear.addEventListener('click', () => {
-            panelOpen = !panelOpen;
-            if (panelOpen) {
-                panel.style.display = 'block';
-                requestAnimationFrame(() => {
-                    panel.style.opacity = '1';
-                    panel.style.transform = 'translateY(0)';
-                });
-            } else {
-                panel.style.opacity = '0';
-                panel.style.transform = 'translateY(10px)';
-                setTimeout(() => { panel.style.display = 'none'; }, 200);
+        var hdr = document.createElement('div'); hdr.style.cssText = 'background:#232f3e;color:#fff;padding:16px 20px;display:flex;align-items:center;justify-content:space-between;';
+        var ht = document.createElement('span'); ht.textContent = '\u2699\uFE0F Poirot V3 Settings'; ht.style.cssText = 'font-size:16px;font-weight:bold;';
+        var hv = document.createElement('span'); hv.textContent = 'v33.4'; hv.style.cssText = 'font-size:12px;color:#ff9900;background:#37475a;padding:2px 8px;border-radius:10px;';
+        hdr.appendChild(ht); hdr.appendChild(hv);
+        var body = document.createElement('div'); body.style.cssText = 'padding:16px 20px;';
+        body.appendChild(mkToggle('Auto Enter Quantity', 'Automatically fills and confirms the quantity.', settings.autoQuantity, function(v) { settings.autoQuantity = v; saveSettings(settings); }));
+        var dv = document.createElement('div'); dv.style.cssText = 'height:1px;background:#eee;margin:12px 0;'; body.appendChild(dv);
+        var sr = document.createElement('div'); sr.style.cssText = 'display:flex;align-items:center;justify-content:space-between;';
+        var sl = document.createElement('span'); sl.textContent = 'Script Status'; sl.style.cssText = 'font-size:13px;color:#555;';
+        var sb = document.createElement('span'); sb.textContent = '\u2705 Active'; sb.style.cssText = 'font-size:12px;color:#067d06;background:#e6f9e6;padding:3px 10px;border-radius:10px;font-weight:600;';
+        sr.appendChild(sl); sr.appendChild(sb); body.appendChild(sr);
+        panel.appendChild(hdr); panel.appendChild(body);
+        var open = false;
+        gear.addEventListener('click', function() {
+            open = !open;
+            if (open) { panel.style.display = 'block'; requestAnimationFrame(function() { panel.style.opacity = '1'; panel.style.transform = 'translateY(0)'; }); }
+            else { panel.style.opacity = '0'; panel.style.transform = 'translateY(10px)'; setTimeout(function() { panel.style.display = 'none'; }, 200); }
+        });
+        document.addEventListener('click', function(e) {
+            if (open && !panel.contains(e.target) && e.target !== gear) {
+                open = false; panel.style.opacity = '0'; panel.style.transform = 'translateY(10px)';
+                setTimeout(function() { panel.style.display = 'none'; }, 200);
             }
         });
-
-        document.addEventListener('click', (e) => {
-            if (panelOpen && !panel.contains(e.target) && e.target !== gear) {
-                panelOpen = false;
-                panel.style.opacity = '0';
-                panel.style.transform = 'translateY(10px)';
-                setTimeout(() => { panel.style.display = 'none'; }, 200);
-            }
-        });
-
-        document.body.appendChild(gear);
-        document.body.appendChild(panel);
+        document.body.appendChild(gear); document.body.appendChild(panel);
     }
-
-    function createToggleRow(label, description, initialState, onChange) {
-        const row = document.createElement('div');
-        row.style.cssText = 'display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:4px;';
-
-        const textCol = document.createElement('div');
-        textCol.style.cssText = 'flex:1;';
-
-        const labelEl = document.createElement('div');
-        labelEl.textContent = label;
-        labelEl.style.cssText = 'font-size:14px;font-weight:600;color:#111;margin-bottom:2px;';
-
-        const descEl = document.createElement('div');
-        descEl.textContent = description;
-        descEl.style.cssText = 'font-size:12px;color:#888;line-height:1.3;';
-
-        textCol.appendChild(labelEl);
-        textCol.appendChild(descEl);
-
-        const toggle = document.createElement('div');
-        toggle.style.cssText = 'width:44px;min-width:44px;height:24px;border-radius:12px;cursor:pointer;position:relative;transition:background 0.2s;margin-top:2px;' +
-            (initialState ? 'background:#ff9900;' : 'background:#ccc;');
-
-        const knob = document.createElement('div');
-        knob.style.cssText = 'width:20px;height:20px;border-radius:50%;background:#fff;position:absolute;top:2px;transition:left 0.2s;box-shadow:0 1px 3px rgba(0,0,0,0.2);' +
-            (initialState ? 'left:22px;' : 'left:2px;');
-
-        toggle.appendChild(knob);
-
-        let state = initialState;
-        toggle.addEventListener('click', () => {
-            state = !state;
-            toggle.style.background = state ? '#ff9900' : '#ccc';
-            knob.style.left = state ? '22px' : '2px';
-            onChange(state);
-        });
-
-        row.appendChild(textCol);
-        row.appendChild(toggle);
-        return row;
+    function mkToggle(label, desc, init, onChange) {
+        var row = document.createElement('div'); row.style.cssText = 'display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:4px;';
+        var tc = document.createElement('div'); tc.style.cssText = 'flex:1;';
+        var lb = document.createElement('div'); lb.textContent = label; lb.style.cssText = 'font-size:14px;font-weight:600;color:#111;margin-bottom:2px;';
+        var ds = document.createElement('div'); ds.textContent = desc; ds.style.cssText = 'font-size:12px;color:#888;line-height:1.3;';
+        tc.appendChild(lb); tc.appendChild(ds);
+        var tg = document.createElement('div'); tg.style.cssText = 'width:44px;min-width:44px;height:24px;border-radius:12px;cursor:pointer;position:relative;transition:background 0.2s;margin-top:2px;' + (init ? 'background:#ff9900;' : 'background:#ccc;');
+        var kn = document.createElement('div'); kn.style.cssText = 'width:20px;height:20px;border-radius:50%;background:#fff;position:absolute;top:2px;transition:left 0.2s;box-shadow:0 1px 3px rgba(0,0,0,0.2);' + (init ? 'left:22px;' : 'left:2px;');
+        tg.appendChild(kn);
+        var st = init;
+        tg.addEventListener('click', function() { st = !st; tg.style.background = st ? '#ff9900' : '#ccc'; kn.style.left = st ? '22px' : '2px'; onChange(st); });
+        row.appendChild(tc); row.appendChild(tg); return row;
     }
-
-    setTimeout(createSettingsMenu, 1000);
-
-    // =============================================
-    // CORE FUNCTIONS
-    // =============================================
+    setTimeout(createMenu, 1000);
 
     function getFNSKU() {
-        const alchemyTags = document.querySelectorAll('alchemy-tag');
-        for (const tag of alchemyTags) {
-            const root = tag.shadowRoot;
-            if (root) {
-                const textContent = root.textContent || '';
-                const match = textContent.match(/FNSKU\s*:\s*([A-Z0-9]+)/i);
-                if (match) return match[1];
-            }
-            const text = tag.textContent || '';
-            const match = text.match(/FNSKU\s*:\s*([A-Z0-9]+)/i);
-            if (match) return match[1];
+        var tags = document.querySelectorAll('alchemy-tag');
+        for (var i = 0; i < tags.length; i++) {
+            var r = tags[i].shadowRoot; if (r) { var m = (r.textContent || '').match(/FNSKU\s*:\s*([A-Z0-9]+)/i); if (m) return m[1]; }
+            var m2 = (tags[i].textContent || '').match(/FNSKU\s*:\s*([A-Z0-9]+)/i); if (m2) return m2[1];
         }
-        return searchDeep(document.body);
+        return sDeep(document.body);
     }
-
-    function searchDeep(node) {
-        if (node.nodeType === Node.TEXT_NODE) {
-            const match = node.textContent.match(/FNSKU\s*:\s*([A-Z0-9]+)/i);
-            if (match) return match[1];
-        }
-        if (node.shadowRoot) {
-            const result = searchDeep(node.shadowRoot);
-            if (result) return result;
-        }
-        for (const child of (node.children || node.childNodes || [])) {
-            const result = searchDeep(child);
-            if (result) return result;
-        }
+    function sDeep(n) {
+        if (n.nodeType === Node.TEXT_NODE) { var m = n.textContent.match(/FNSKU\s*:\s*([A-Z0-9]+)/i); if (m) return m[1]; }
+        if (n.shadowRoot) { var r = sDeep(n.shadowRoot); if (r) return r; }
+        var ch = n.children || n.childNodes || [];
+        for (var i = 0; i < ch.length; i++) { var r2 = sDeep(ch[i]); if (r2) return r2; }
         return null;
     }
 
-    function getScanInput() {
-        const inputs = document.querySelectorAll('input[type="text"], input:not([type]), input[type="search"]');
-        for (const input of inputs) {
-            if (input.offsetParent !== null) return input;
-        }
-        const alchemyInputs = document.querySelectorAll('alchemy-input, alchemy-text-field');
-        for (const ai of alchemyInputs) {
-            if (ai.shadowRoot) {
-                const input = ai.shadowRoot.querySelector('input');
-                if (input) return input;
-            }
-        }
+    function getInput() {
+        var inps = document.querySelectorAll('input[type="text"], input:not([type]), input[type="search"]');
+        for (var i = 0; i < inps.length; i++) { if (inps[i].offsetParent !== null) return inps[i]; }
+        var ai = document.querySelectorAll('alchemy-input, alchemy-text-field');
+        for (var j = 0; j < ai.length; j++) { if (ai[j].shadowRoot) { var inp = ai[j].shadowRoot.querySelector('input'); if (inp) return inp; } }
         return null;
     }
 
-    function setNativeValue(input, value) {
-        const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-            window.HTMLInputElement.prototype, 'value'
-        ).set;
-        nativeInputValueSetter.call(input, value);
-        input.dispatchEvent(new Event('input', { bubbles: true }));
-        input.dispatchEvent(new Event('change', { bubbles: true }));
+    function setVal(inp, v) {
+        Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set.call(inp, v);
+        inp.dispatchEvent(new Event('input', { bubbles: true }));
+        inp.dispatchEvent(new Event('change', { bubbles: true }));
     }
 
-    function pressEnter(element) {
-        ['keydown', 'keypress', 'keyup'].forEach((type) => {
-            element.dispatchEvent(new KeyboardEvent(type, {
-                key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true,
-            }));
+    function pressEnter(el) {
+        ['keydown', 'keypress', 'keyup'].forEach(function(t) {
+            el.dispatchEvent(new KeyboardEvent(t, { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
         });
     }
 
-    function attemptAutoFill() {
-        if (waitingForFC) return;
-        const fnsku = getFNSKU();
-        const input = getScanInput();
-        if (fnsku && input) {
-            if (input.value === '' && fnsku !== lastFilledFNSKU) {
-                input.focus();
-                setNativeValue(input, fnsku);
-                lastFilledFNSKU = fnsku;
-                setTimeout(() => { pressEnter(input); }, DELAY_BEFORE_ENTER);
+    function autoFill() {
+        if (waitFC) return;
+        var fn = getFNSKU(), inp = getInput();
+        console.log('[Poirot] autoFill — FNSKU:' + (fn || 'null') + ' input:' + (inp ? 'found' : 'null') + ' val:"' + (inp ? inp.value : '') + '"');
+        if (!fn || !inp || inp.value !== '') return;
+        console.log('[Poirot] autoFill FILLING: ' + fn);
+        inp.focus(); setVal(inp, fn); lastFN = fn;
+        setTimeout(function() { pressEnter(inp); }, D_ENTER);
+    }
+
+    function showFBA() {
+        if (document.getElementById('poirot-fba')) return;
+        fbaShown = true; waitFC = true;
+        var ov = document.createElement('div'); ov.id = 'poirot-fba';
+        ov.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.6);z-index:99999;display:flex;align-items:center;justify-content:center;';
+        var md = document.createElement('div');
+        md.style.cssText = 'background:#fff;border-radius:12px;padding:32px;max-width:460px;width:90%;box-shadow:0 8px 32px rgba(0,0,0,0.3);text-align:center;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;';
+        var ic = document.createElement('div'); ic.textContent = '\uD83D\uDCE6'; ic.style.cssText = 'font-size:48px;margin-bottom:12px;';
+        var ti = document.createElement('h2'); ti.textContent = 'No Inventory Found'; ti.style.cssText = 'margin:0 0 8px 0;font-size:20px;color:#111;';
+        var su = document.createElement('p'); su.textContent = 'FC Research returned no inventory history. Scan or type the FBA shipping label barcode.';
+        su.style.cssText = 'margin:0 0 20px 0;font-size:14px;color:#555;line-height:1.4;';
+        var inp = document.createElement('input'); inp.type = 'text'; inp.placeholder = 'Scan FBA label barcode...'; inp.autocomplete = 'off';
+        inp.style.cssText = 'width:100%;padding:14px 16px;font-size:18px;border:2px solid #ddd;border-radius:8px;outline:none;box-sizing:border-box;text-align:center;transition:border-color 0.2s;';
+        inp.addEventListener('focus', function() { inp.style.borderColor = '#ff9900'; });
+        inp.addEventListener('blur', function() { inp.style.borderColor = '#ddd'; });
+        var sBtn = document.createElement('button'); sBtn.textContent = '\uD83D\uDD0D Search FC Research';
+        sBtn.style.cssText = 'display:block;width:100%;margin-top:16px;padding:14px;background:#ff9900;color:#111;font-size:16px;font-weight:bold;border:none;border-radius:8px;cursor:pointer;';
+        var sk = document.createElement('button'); sk.textContent = 'Skip';
+        sk.style.cssText = 'display:block;width:100%;margin-top:8px;padding:10px;background:transparent;color:#666;font-size:14px;border:1px solid #ddd;border-radius:8px;cursor:pointer;';
+        var st = document.createElement('p'); st.style.cssText = 'margin:12px 0 0 0;font-size:13px;color:#c00;display:none;';
+        function submit() {
+            var v = inp.value.trim();
+            if (!v) { st.textContent = 'Please enter a barcode.'; st.style.display = 'block'; inp.focus(); return; }
+            st.textContent = 'Opening FC Research...'; st.style.color = '#067d06'; st.style.display = 'block';
+            sBtn.disabled = true; sBtn.style.background = '#ccc';
+            clearData('poirot_fc_ready'); clearData('poirot_fc_asin'); clearData('poirot_fc_quantity'); clearData('poirot_fc_empty');
+            fcDataH = false; fcEmptyH = false;
+            window.open(buildUrl(v), '_blank');
+            setTimeout(function() { ov.remove(); fbaShown = false; }, 1000);
+        }
+        function close() { ov.remove(); fbaShown = false; waitFC = false; }
+        inp.addEventListener('keydown', function(e) { if (e.key === 'Enter') { e.preventDefault(); submit(); } });
+        sBtn.addEventListener('click', submit); sk.addEventListener('click', close);
+        ov.addEventListener('click', function(e) { if (e.target === ov) close(); });
+        md.appendChild(ic); md.appendChild(ti); md.appendChild(su); md.appendChild(inp); md.appendChild(st); md.appendChild(sBtn); md.appendChild(sk);
+        ov.appendChild(md); document.body.appendChild(ov);
+        setTimeout(function() { inp.focus(); }, 100);
+    }
+
+    new MutationObserver(function(muts) {
+        for (var i = 0; i < muts.length; i++) {
+            for (var j = 0; j < muts[i].addedNodes.length; j++) {
+                var n = muts[i].addedNodes[j]; if (n.nodeType !== 1) continue;
+                var se = (n.classList && n.classList.contains('alert--success')) ? n : (n.querySelector ? n.querySelector('.alert--success') : null);
+                if (se) { markSucc(); setTimeout(function() { clickCh(); }, D_BANNER); }
             }
         }
-    }
+    }).observe(document.body, { childList: true, subtree: true });
 
-    function showFBALabelPopup() {
-        if (document.getElementById('poirot-fba-overlay')) return;
-        fbaPopupShown = true;
-        waitingForFC = true;
-
-        const overlay = document.createElement('div');
-        overlay.id = 'poirot-fba-overlay';
-        overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.6);z-index:99999;display:flex;align-items:center;justify-content:center;';
-
-        const modal = document.createElement('div');
-        modal.style.cssText = 'background:#fff;border-radius:12px;padding:32px;max-width:460px;width:90%;box-shadow:0 8px 32px rgba(0,0,0,0.3);text-align:center;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;';
-
-        const icon = document.createElement('div');
-        icon.textContent = '\uD83D\uDCE6';
-        icon.style.cssText = 'font-size:48px;margin-bottom:12px;';
-
-        const title = document.createElement('h2');
-        title.textContent = 'No Inventory Found';
-        title.style.cssText = 'margin:0 0 8px 0;font-size:20px;color:#111;';
-
-        const subtitle = document.createElement('p');
-        subtitle.textContent = 'FC Research returned no inventory history. Scan or type the FBA shipping label barcode to look up this item.';
-        subtitle.style.cssText = 'margin:0 0 20px 0;font-size:14px;color:#555;line-height:1.4;';
-
-        const input = document.createElement('input');
-        input.type = 'text';
-        input.placeholder = 'Scan FBA label barcode...';
-        input.autocomplete = 'off';
-        input.style.cssText = 'width:100%;padding:14px 16px;font-size:18px;border:2px solid #ddd;border-radius:8px;outline:none;box-sizing:border-box;text-align:center;transition:border-color 0.2s;';
-        input.addEventListener('focus', () => { input.style.borderColor = '#ff9900'; });
-        input.addEventListener('blur', () => { input.style.borderColor = '#ddd'; });
-
-        const searchBtn = document.createElement('button');
-        searchBtn.textContent = '\uD83D\uDD0D Search FC Research';
-        searchBtn.style.cssText = 'display:block;width:100%;margin-top:16px;padding:14px;background:#ff9900;color:#111;font-size:16px;font-weight:bold;border:none;border-radius:8px;cursor:pointer;transition:background 0.2s;';
-        searchBtn.addEventListener('mouseenter', () => { searchBtn.style.background = '#e88a00'; });
-        searchBtn.addEventListener('mouseleave', () => { searchBtn.style.background = '#ff9900'; });
-
-        const skipBtn = document.createElement('button');
-        skipBtn.textContent = 'Skip';
-        skipBtn.style.cssText = 'display:block;width:100%;margin-top:8px;padding:10px;background:transparent;color:#666;font-size:14px;border:1px solid #ddd;border-radius:8px;cursor:pointer;transition:background 0.2s;';
-        skipBtn.addEventListener('mouseenter', () => { skipBtn.style.background = '#f5f5f5'; });
-        skipBtn.addEventListener('mouseleave', () => { skipBtn.style.background = 'transparent'; });
-
-        const status = document.createElement('p');
-        status.style.cssText = 'margin:12px 0 0 0;font-size:13px;color:#c00;display:none;';
-
-        function submitFBALabel() {
-            const val = input.value.trim();
-            if (!val) { status.textContent = 'Please scan or enter a barcode.'; status.style.display = 'block'; input.focus(); return; }
-            status.textContent = 'Opening FC Research...'; status.style.color = '#067d06'; status.style.display = 'block';
-            searchBtn.disabled = true; searchBtn.style.background = '#ccc'; searchBtn.style.cursor = 'default';
-            clearCrossCookie('poirot_fc_ready'); clearCrossCookie('poirot_fc_asin');
-            clearCrossCookie('poirot_fc_quantity'); clearCrossCookie('poirot_fc_empty');
-            fcDataHandled = false; fcEmptyHandled = false;
-            window.open(buildFCResultsUrl(val), '_blank');
-            setTimeout(() => { overlay.remove(); fbaPopupShown = false; }, 1000);
-        }
-
-        function closePopup() { overlay.remove(); fbaPopupShown = false; waitingForFC = false; }
-
-        input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); submitFBALabel(); } });
-        searchBtn.addEventListener('click', submitFBALabel);
-        skipBtn.addEventListener('click', closePopup);
-        overlay.addEventListener('click', (e) => { if (e.target === overlay) closePopup(); });
-
-        modal.appendChild(icon); modal.appendChild(title); modal.appendChild(subtitle);
-        modal.appendChild(input); modal.appendChild(status); modal.appendChild(searchBtn); modal.appendChild(skipBtn);
-        overlay.appendChild(modal); document.body.appendChild(overlay);
-        setTimeout(() => { input.focus(); }, 100);
-    }
-
-    function setupSuccessBannerObserver() {
-        const obs = new MutationObserver((mutations) => {
-            for (const mutation of mutations) {
-                for (const node of mutation.addedNodes) {
-                    if (node.nodeType !== Node.ELEMENT_NODE) continue;
-                    const successEl = node.classList && node.classList.contains('alert--success')
-                        ? node : node.querySelector && node.querySelector('.alert--success');
-                    if (successEl) {
-                        markSuccessFired();
-                        setTimeout(() => {
-                            const btn = document.getElementById('change-container-button');
-                            if (btn) { btn.click(); if (btn.shadowRoot) { const ib = btn.shadowRoot.querySelector('button'); if (ib) ib.click(); } }
-                        }, DELAY_AFTER_SUCCESS_BANNER);
-                    }
-                }
-            }
-        });
-        obs.observe(document.body, { childList: true, subtree: true });
-    }
-    setupSuccessBannerObserver();
-
-    function isSidelineApp() {
-        if (document.getElementById('change-container-button')) return true;
-        if (document.querySelector('alchemy-button#change-container-button')) return true;
-        const te = document.querySelectorAll('header, nav, [class*="app-bar"], [class*="toolbar"], [class*="nav"], [class*="title"]');
-        for (const el of te) { if (el.textContent.toLowerCase().includes('sideline')) return true; }
+    function isSL() {
+        if (document.getElementById('change-container-button') || document.querySelector('alchemy-button#change-container-button')) return true;
         if (document.title.toLowerCase().includes('sideline')) return true;
-        const btns = document.querySelectorAll('button, alchemy-button');
-        for (const b of btns) { const t = b.textContent.trim().toLowerCase(); if (t.includes('change container') || t.includes('back to source container')) return true; }
         return false;
     }
 
-    function hasSuccessBanner() {
-        const all = document.querySelectorAll('[class*="success"], [class*="Success"], [class*="banner"], [class*="toast"], [class*="alert"], [class*="notification"], [class*="message"]');
-        for (const el of all) { if (el.textContent.trim().toLowerCase().includes('success')) return true; }
-        const spans = document.querySelectorAll('span, div, p');
-        for (const el of spans) { const t = el.textContent.trim(); if ((t === 'Success' || t.startsWith('Success')) && (el.offsetParent !== null || el.offsetHeight > 0)) return true; }
+    function clickCh() {
+        var btn = document.getElementById('change-container-button') || document.querySelector('alchemy-button#change-container-button');
+        if (!btn) { var c = document.querySelectorAll('alchemy-button, button'); for (var i = 0; i < c.length; i++) { if ((c[i].textContent || '').trim().toLowerCase().includes('change container')) { btn = c[i]; break; } } }
+        if (btn) { btn.focus(); btn.click(); if (btn.shadowRoot) { var ib = btn.shadowRoot.querySelector('button'); if (ib) ib.click(); } return true; }
         return false;
     }
 
-    function clickChangeContainer() {
-        let btn = document.getElementById('change-container-button') || document.querySelector('alchemy-button#change-container-button') || document.querySelector('[id="change-container-button"]');
-        if (!btn) { const c = document.querySelectorAll('alchemy-button, button'); for (const el of c) { if ((el.textContent || '').trim().toLowerCase().includes('change container')) { btn = el; break; } } }
-        if (btn) {
-            const r = btn.getBoundingClientRect(); const x = r.left + r.width / 2, y = r.top + r.height / 2;
-            btn.focus();
-            btn.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, clientX: x, clientY: y, pointerId: 1 }));
-            btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, clientX: x, clientY: y, button: 0 }));
-            btn.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true, clientX: x, clientY: y, pointerId: 1 }));
-            btn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, clientX: x, clientY: y, button: 0 }));
-            btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, clientX: x, clientY: y, button: 0 }));
-            btn.click();
-            if (btn.shadowRoot) { const ib = btn.shadowRoot.querySelector('button'); if (ib) ib.click(); }
-            return true;
-        }
-        document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'c', code: 'KeyC', keyCode: 67, which: 67, bubbles: true }));
-        document.body.dispatchEvent(new KeyboardEvent('keypress', { key: 'c', code: 'KeyC', keyCode: 67, which: 67, bubbles: true }));
-        document.body.dispatchEvent(new KeyboardEvent('keyup', { key: 'c', code: 'KeyC', keyCode: 67, which: 67, bubbles: true }));
-        return false;
+    function clickConf() {
+        if (waitFC) return false;
+        var btn = document.getElementById('confirm-button') || document.querySelector('button#confirm-button') || document.querySelector('.confirm-button-container button') || document.querySelector('button.btn-primary');
+        if (btn) { btn.focus(); btn.click(); return true; }
+        pressEnter(document.body); return false;
     }
 
-    function handleSidelineSuccess() {
-        if (sidelineSuccessHandled) return;
-        if (isSidelineApp() && isScanPage() && hasSuccessBanner()) {
-            sidelineSuccessHandled = true;
-            markSuccessFired();
-            setTimeout(() => { clickChangeContainer(); }, DELAY_BEFORE_CHANGE_CONTAINER);
-        }
+    function attachDest() {
+        if (destH) return; var inp = getInput(); if (!inp) return; destH = true;
+        inp.addEventListener('paste', function() { setTimeout(function() { clickConf(); }, D_ENTER); });
+        inp.addEventListener('change', function() { if (inp.value.length > 0) setTimeout(function() { clickConf(); }, D_CONFIRM); });
     }
 
-    function clickItemMatch() {
-        if (waitingForFC) return false;
-        const btn = document.getElementById('confirm-button') || document.querySelector('button#confirm-button') || document.querySelector('.confirm-button-container button') || document.querySelector('button.btn-primary');
-        if (btn) {
-            const r = btn.getBoundingClientRect(); const x = r.left + r.width / 2, y = r.top + r.height / 2;
-            btn.focus();
-            btn.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, clientX: x, clientY: y, pointerId: 1 }));
-            btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, clientX: x, clientY: y, button: 0 }));
-            btn.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true, clientX: x, clientY: y, pointerId: 1 }));
-            btn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, clientX: x, clientY: y, button: 0 }));
-            btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, clientX: x, clientY: y, button: 0 }));
-            btn.click();
-            return true;
-        }
-        pressEnter(document.body);
-        return false;
-    }
-
-    function attachDestinationPasteListener() {
-        if (destinationListenerAttached) return;
-        const input = getScanInput();
-        if (!input) return;
-        destinationListenerAttached = true;
-        input.addEventListener('paste', () => { setTimeout(() => { clickItemMatch(); }, DELAY_BEFORE_ENTER); });
-        input.addEventListener('change', () => { if (input.value.length > 0) setTimeout(() => { clickItemMatch(); }, DELAY_BEFORE_CONFIRM); });
-    }
-
-    function openFCResearch(containerId) {
-        const existing = document.getElementById('poirot-fc-btn');
-        if (existing) existing.remove();
-        waitingForFC = true;
-
-        const btn = document.createElement('a');
-        btn.id = 'poirot-fc-btn';
-        btn.href = buildFCResultsUrl(containerId);
-        btn.target = '_blank';
-        btn.textContent = '\uD83D\uDD0D Search "' + containerId + '" on FC Research';
+    function openFC(cid) {
+        var ex = document.getElementById('poirot-fc-btn'); if (ex) ex.remove();
+        waitFC = true;
+        clearData('poirot_fc_ready'); clearData('poirot_fc_asin'); clearData('poirot_fc_quantity'); clearData('poirot_fc_empty');
+        var btn = document.createElement('a'); btn.id = 'poirot-fc-btn'; btn.href = buildUrl(cid); btn.target = '_blank';
+        btn.textContent = '\uD83D\uDD0D Search "' + cid + '" on FC Research';
         btn.style.cssText = 'display:block;margin:16px auto;padding:14px 28px;background:#ff9900;color:#111;font-size:16px;font-weight:bold;text-align:center;text-decoration:none;border-radius:8px;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,0.2);max-width:500px;';
-
-        const allSpans = document.querySelectorAll('span, div, p');
-        let noItemsEl = null;
-        for (const el of allSpans) { if (el.textContent.trim() === 'No items found in this container.') { noItemsEl = el; break; } }
-        if (noItemsEl) noItemsEl.parentNode.insertBefore(btn, noItemsEl.nextSibling);
-        else document.body.appendChild(btn);
-
-        clearCrossCookie('poirot_fc_ready'); clearCrossCookie('poirot_fc_asin');
-        clearCrossCookie('poirot_fc_quantity'); clearCrossCookie('poirot_fc_empty');
+        var spans = document.querySelectorAll('span, div, p'); var noEl = null;
+        for (var i = 0; i < spans.length; i++) { if (spans[i].textContent.trim() === 'No items found in this container.') { noEl = spans[i]; break; } }
+        if (noEl) noEl.parentNode.insertBefore(btn, noEl.nextSibling); else document.body.appendChild(btn);
         btn.click();
     }
 
-    function checkForFCData() {
-        const empty = getCrossCookie('poirot_fc_empty');
-        if (empty && !fcEmptyHandled) {
-            fcEmptyHandled = true;
-            clearCrossCookie('poirot_fc_empty');
-            showFBALabelPopup();
-            return true;
-        }
-        const ready = getCrossCookie('poirot_fc_ready');
-        if (ready && !fcDataHandled) {
-            const asin = getCrossCookie('poirot_fc_asin');
-            const quantity = getCrossCookie('poirot_fc_quantity');
-            console.log('[Poirot] FC data received — ASIN: ' + asin + ', Qty: ' + quantity);
-            if (asin) {
-                fcDataHandled = true;
-                waitingForFC = false;
-                clearCrossCookie('poirot_fc_ready');
-                clearCrossCookie('poirot_fc_asin');
-                const input = getScanInput();
-                if (input) {
-                    input.focus();
-                    setNativeValue(input, asin);
-                    lastFilledFNSKU = asin;
-                    setTimeout(() => { clickItemMatch(); }, DELAY_BEFORE_CONFIRM);
-                }
-                if (quantity) {
-                    sessionStorage.setItem('poirot_fc_quantity', quantity);
-                    console.log('[Poirot] Quantity stored in sessionStorage: ' + quantity);
-                }
+    function checkFC() {
+        var emp = getData('poirot_fc_empty');
+        if (emp === 'true' && !fcEmptyH) { fcEmptyH = true; clearData('poirot_fc_empty'); showFBA(); return true; }
+        var rdy = getData('poirot_fc_ready');
+        if (rdy === 'true' && !fcDataH) {
+            var asin = getData('poirot_fc_asin');
+            var qty = getData('poirot_fc_quantity');
+            console.log('[Poirot] FC ready — ASIN:' + asin + ' Qty:' + qty + ' validASIN:' + isValidASIN(asin) + ' validQty:' + isValidQty(qty));
+            if (asin && isValidASIN(asin)) {
+                fcDataH = true; waitFC = false;
+                clearData('poirot_fc_ready'); clearData('poirot_fc_asin'); clearData('poirot_fc_quantity');
+                lastFN = '';
+                var inp = getInput();
+                if (inp) { inp.focus(); setVal(inp, asin); lastFN = asin; setTimeout(function() { clickConf(); }, D_CONFIRM); }
+                if (qty && isValidQty(qty)) sessionStorage.setItem('poirot_fc_quantity', qty);
+                return true;
+            } else if (asin && !isValidASIN(asin)) {
+                console.log('[Poirot] Invalid ASIN: "' + asin + '" — showing FBA popup');
+                fcDataH = true; waitFC = false;
+                clearData('poirot_fc_ready'); clearData('poirot_fc_asin'); clearData('poirot_fc_quantity');
+                showFBA();
                 return true;
             }
         }
         return false;
     }
 
-    function fillQuantityFromFC() {
+    function fillQty() {
         settings = getSettings();
-        if (!settings.autoQuantity) {
-            console.log('[Poirot] Auto-quantity DISABLED by user. Skipping.');
-            sessionStorage.removeItem('poirot_fc_quantity');
-            clearCrossCookie('poirot_fc_quantity');
-            return true;
-        }
-
-        const quantity = sessionStorage.getItem('poirot_fc_quantity');
-        if (quantity) {
-            const input = getScanInput();
-            if (input) {
-                console.log('[Poirot] Filling quantity: ' + quantity);
-                input.focus();
-                setNativeValue(input, quantity);
-                setTimeout(() => { clickItemMatch(); sessionStorage.removeItem('poirot_fc_quantity'); clearCrossCookie('poirot_fc_quantity'); }, DELAY_BEFORE_CONFIRM);
-                return true;
-            }
+        if (!settings.autoQuantity) { sessionStorage.removeItem('poirot_fc_quantity'); return true; }
+        var qty = sessionStorage.getItem('poirot_fc_quantity');
+        if (qty && isValidQty(qty)) {
+            var inp = getInput();
+            if (inp) { inp.focus(); setVal(inp, qty); setTimeout(function() { clickConf(); sessionStorage.removeItem('poirot_fc_quantity'); }, D_CONFIRM); return true; }
         }
         return false;
     }
 
-    // =============================================
-    // MAIN CHECK
-    // =============================================
     function mainCheck() {
-        if (checkForFCData()) return;
-        if (waitingForFC) return;
+        if (checkFC()) return;
+        if (waitFC) return;
 
-        const onScan = isScanPage();
-        const onDest = isDestinationPage();
-        const onVerify = isVerifyPage();
-        const onQty = isQuantityPage();
-        const empty = isEmptyContainer();
-        const hasBanner = hasSuccessBanner();
-        const cooldown = isInSuccessCooldown();
-        console.log('[Poirot] mainCheck — scan:' + onScan + ' dest:' + onDest + ' verify:' + onVerify + ' qty:' + onQty + ' empty:' + empty + ' banner:' + hasBanner + ' cooldown:' + cooldown + ' emptyHandled:' + emptyContainerHandled);
+        var state = getPageState();
+        var emp = isEmp();
+        var ban = hasBan();
+        var cool = inCool();
+        var cid = getCid();
 
-        if (isSidelineApp() && onScan && hasBanner) { handleSidelineSuccess(); return; }
-
-        if (onScan && !hasBanner) {
-            const cid = getSourceContainerId();
-
-            if (empty && !emptyContainerHandled) {
-                if (cooldown) {
-                    console.log('[Poirot] Empty container during success cooldown — skipping FC lookup.');
-                    return;
-                }
-                emptyContainerHandled = true;
-                console.log('[Poirot] TRIGGERING FC Research for container: ' + (cid || 'NONE — showing FBA popup'));
-                if (cid) { openFCResearch(cid); } else { showFBALabelPopup(); }
-                return;
-            } else if (!empty) {
-                emptyContainerHandled = false; fcDataHandled = false; fcEmptyHandled = false; fbaPopupShown = false;
-            }
+        if (cid && cid !== lastCid) {
+            console.log('[Poirot] Container: ' + lastCid + ' → ' + cid);
+            lastCid = cid; lastFN = '';
+            emptyH = false; fcDataH = false; fcEmptyH = false; fbaShown = false;
+            successH = false; verifyH = false; qtyH = false; destH = false;
         }
 
-        if (onVerify) {
-            if (!verifyHandled) { verifyHandled = true; setTimeout(() => { clickItemMatch(); }, DELAY_BEFORE_CONFIRM); }
-        } else if (onQty) {
-            if (!quantityHandled) {
-                quantityHandled = true;
-                settings = getSettings();
-                if (!settings.autoQuantity) {
-                    console.log('[Poirot] Auto-quantity DISABLED. Waiting for manual input.');
-                    const quantity = sessionStorage.getItem('poirot_fc_quantity');
-                    if (quantity) {
-                        const input = getScanInput();
-                        if (input) {
-                            input.focus();
-                            setNativeValue(input, quantity);
-                            sessionStorage.removeItem('poirot_fc_quantity');
-                            clearCrossCookie('poirot_fc_quantity');
-                        }
-                    }
-                } else {
-                    if (!fillQuantityFromFC()) setTimeout(() => { clickItemMatch(); }, DELAY_BEFORE_CONFIRM);
+        console.log('[Poirot] state:' + state + ' empty:' + emp + ' ban:' + ban + ' cool:' + cool + ' cid:' + (cid || 'null'));
+
+        if (state === 'scan' && ban && isSL()) {
+            if (!successH) { successH = true; markSucc(); setTimeout(function() { clickCh(); }, D_CHANGE); }
+            return;
+        }
+
+        switch (state) {
+            case 'scan':
+                successH = false; verifyH = false; qtyH = false; destH = false;
+                if (emp && !emptyH) {
+                    if (cool) return;
+                    emptyH = true;
+                    console.log('[Poirot] TRIGGER FC: ' + (cid || 'NONE'));
+                    if (cid) openFC(cid); else showFBA();
+                } else if (!emp) {
+                    emptyH = false; fcDataH = false; fcEmptyH = false; fbaShown = false;
+                    autoFill();
                 }
-            }
-        } else if (onDest) {
-            verifyHandled = false; quantityHandled = false; attachDestinationPasteListener();
-        } else if (onScan) {
-            verifyHandled = false; quantityHandled = false; destinationListenerAttached = false;
-            if (!hasBanner) sidelineSuccessHandled = false;
-            attemptAutoFill();
-        } else {
-            verifyHandled = false; quantityHandled = false; destinationListenerAttached = false; sidelineSuccessHandled = false;
-            attemptAutoFill();
+                break;
+            case 'verify':
+                if (!verifyH) { verifyH = true; setTimeout(function() { clickConf(); }, D_CONFIRM); }
+                break;
+            case 'quantity':
+                if (!qtyH) {
+                    qtyH = true; settings = getSettings();
+                    if (!settings.autoQuantity) {
+                        var q = sessionStorage.getItem('poirot_fc_quantity');
+                        if (q) { var inp2 = getInput(); if (inp2) { inp2.focus(); setVal(inp2, q); sessionStorage.removeItem('poirot_fc_quantity'); } }
+                    } else { if (!fillQty()) setTimeout(function() { clickConf(); }, D_CONFIRM); }
+                }
+                break;
+            case 'destination':
+                verifyH = false; qtyH = false; attachDest();
+                break;
+            default:
+                autoFill();
+                break;
         }
     }
 
-    let debounceTimer = null;
-    function debouncedMainCheck() { clearTimeout(debounceTimer); debounceTimer = setTimeout(mainCheck, DELAY_BEFORE_FILL); }
-
-    setInterval(() => {
-        if (!fcDataHandled && getCrossCookie('poirot_fc_ready')) mainCheck();
-        if (!fcEmptyHandled && getCrossCookie('poirot_fc_empty')) mainCheck();
-    }, 1000);
-
-    const observer = new MutationObserver(debouncedMainCheck);
-    observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+    var deb = null;
+    function debCheck() { clearTimeout(deb); deb = setTimeout(mainCheck, D_FILL); }
+    setInterval(function() {
+        var rdy = getData('poirot_fc_ready');
+        var emp2 = getData('poirot_fc_empty');
+        if (rdy === 'true' && !fcDataH) mainCheck();
+        if (emp2 === 'true' && !fcEmptyH) mainCheck();
+    }, 500);
+    new MutationObserver(debCheck).observe(document.body, { childList: true, subtree: true, characterData: true });
     setTimeout(mainCheck, 1500);
 
-    console
+    console.log('[Poirot] v33.4 loaded — split-table SSCC + GM_setValue + ASIN validation.');
+})();
+
