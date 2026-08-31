@@ -2,8 +2,8 @@
 // ==UserScript==
 // @name         Poirot V3 - Auto Fill FNSKU & Auto Confirm
 // @namespace    http://tampermonkey.net/
-// @version      32.1
-// @description  Full Poirot V3 automation + FC Research. SSCC by data-section-type. Settings menu. Robust empty container detection.
+// @version      32.2
+// @description  Full Poirot V3 automation + FC Research. SSCC by data-section-type. Settings menu. Shadow DOM aware page detection.
 // @match        https://aft-poirot-website.na.aftx.amazonoperations.app/?tool=V3*
 // @match        https://aft-poirot-website.na.aftx.amazonoperations.app/*tool=V3*
 // @match        https://aft-poirot-website.na.aftx.amazonoperations.app/*
@@ -61,6 +61,39 @@
 
     function buildFCResultsUrl(searchValue) {
         return 'https://qifcr.na.aftx.amazonoperations.app/KRB3/results?s=' + encodeURIComponent(searchValue);
+    }
+
+    // =============================================
+    // DEEP TEXT SEARCH (pierces Shadow DOM)
+    // =============================================
+    function deepTextSearch(root, searchText) {
+        if (!root) return false;
+        const lower = searchText.toLowerCase();
+
+        // Check text nodes
+        if (root.nodeType === Node.TEXT_NODE) {
+            return root.textContent.toLowerCase().includes(lower);
+        }
+
+        // Check this element's direct text
+        if (root.textContent && root.textContent.toLowerCase().includes(lower)) return true;
+
+        // Check shadow root
+        if (root.shadowRoot) {
+            if (deepTextSearch(root.shadowRoot, searchText)) return true;
+        }
+
+        // Check children
+        const children = root.childNodes || root.children || [];
+        for (const child of children) {
+            if (deepTextSearch(child, searchText)) return true;
+        }
+
+        return false;
+    }
+
+    function deepFindText(searchText) {
+        return deepTextSearch(document.body, searchText);
     }
 
     // =============================================
@@ -386,6 +419,139 @@
     }
 
     // =============================================
+    // PAGE DETECTION (Shadow DOM aware)
+    // =============================================
+    function findPageHeading() {
+        // Method 1: Standard DOM selectors
+        const selectors = 'span.text--size-xxl, h1, h2, h3, h4, h5, h6, [class*="title"], [class*="header"], [class*="heading"]';
+        const els = document.querySelectorAll(selectors);
+        for (const el of els) {
+            const t = el.textContent.replace(/\s+/g, ' ').trim().toLowerCase();
+            if (t.length > 0 && t.length < 100) return t;
+        }
+        return '';
+    }
+
+    function isScanPage() {
+        // Method 1: Standard heading check
+        const heading = findPageHeading();
+        if (heading.includes('scan item')) return true;
+
+        // Method 2: Deep text search (pierces Shadow DOM)
+        if (deepFindText('Scan item')) return true;
+
+        // Method 3: Check for scan-specific elements
+        const changeBtn = document.getElementById('change-container-button') ||
+            document.querySelector('[id="change-container-button"]') ||
+            document.querySelector('alchemy-button#change-container-button');
+        if (changeBtn) {
+            // Has change container button — could be scan page
+            // Make sure it's NOT destination, verify, or quantity
+            if (!isDestinationPage() && !isVerifyPage() && !isQuantityPage()) {
+                // If we see "No items found" or "Item quantity: 0" it's definitely scan page
+                const bodyText = document.body.textContent.toLowerCase();
+                if (bodyText.includes('no items found') || bodyText.includes('item quantity')) {
+                    return true;
+                }
+                // If there's a scan input and no quantity/verify/destination indicators
+                const input = getScanInput();
+                if (input) {
+                    const placeholder = (input.placeholder || '').toLowerCase();
+                    if (placeholder.includes('scan') || placeholder === '') return true;
+                }
+            }
+        }
+
+        // Method 4: Body text contains scan-related indicators without other page indicators
+        const bodyText = document.body.textContent.toLowerCase();
+        if (bodyText.includes('scan item') && !bodyText.includes('enter quantity') && !bodyText.includes('scan destination') && !bodyText.includes('verify item')) {
+            return true;
+        }
+
+        return false;
+    }
+
+    function isVerifyPage() {
+        const heading = findPageHeading();
+        if (heading.includes('verify item')) return true;
+        if (deepFindText('Verify item')) return true;
+        const bodyText = document.body.textContent.toLowerCase();
+        if (bodyText.includes('verify item') && !bodyText.includes('scan item')) return true;
+        return false;
+    }
+
+    function isQuantityPage() {
+        const heading = findPageHeading();
+        if (heading.includes('enter quantity')) return true;
+        if (deepFindText('Enter quantity')) return true;
+        const bodyText = document.body.textContent.toLowerCase();
+        if (bodyText.includes('enter quantity')) return true;
+        return false;
+    }
+
+    function isDestinationPage() {
+        const heading = findPageHeading();
+        if (heading.includes('scan destination') || heading.includes('destination container')) return true;
+        if (deepFindText('Scan destination')) return true;
+        if (deepFindText('Destination container')) return true;
+        const bodyText = document.body.textContent.toLowerCase();
+        if (bodyText.includes('scan destination') || bodyText.includes('destination container')) return true;
+        return false;
+    }
+
+    function isEmptyContainer() {
+        // Approach 1: Check specific span classes
+        const spans = document.querySelectorAll('span.text--size-lg, span.text');
+        for (const el of spans) {
+            if (el.textContent.trim().toLowerCase().includes('no items found')) return true;
+        }
+        // Approach 2: Check item quantity = 0 AND number of rows = 0
+        const bodyText = document.body.textContent.toLowerCase();
+        if (bodyText.includes('item quantity') && bodyText.includes('number of rows')) {
+            const qtyMatch = bodyText.match(/item\s*quantity[:\s]*(\d+)/i);
+            const rowMatch = bodyText.match(/number\s*of\s*rows[:\s]*(\d+)/i);
+            if (qtyMatch && rowMatch && qtyMatch[1] === '0' && rowMatch[1] === '0') {
+                return true;
+            }
+        }
+        // Approach 3: Broad text search
+        if (bodyText.includes('no items found in this container')) return true;
+        // Approach 4: Deep shadow DOM search
+        if (deepFindText('No items found in this container')) return true;
+        return false;
+    }
+
+    function getSourceContainerId() {
+        // Approach 1: Direct ID lookup
+        const label = document.getElementById('source-container-label');
+        if (label) {
+            const text = label.textContent.trim();
+            if (isValidContainerId(text)) return text;
+        }
+        // Approach 2: Search all elements near "Source Container" text
+        const allEls = document.querySelectorAll('span, div, p, label, h1, h2, h3, h4, h5, h6');
+        for (const el of allEls) {
+            const text = el.textContent.trim();
+            if (isValidContainerId(text)) {
+                const parent = el.parentElement;
+                if (parent) {
+                    const parentText = parent.textContent.toLowerCase();
+                    if (parentText.includes('source container') || parentText.includes('change container')) {
+                        return text;
+                    }
+                }
+            }
+        }
+        // Approach 3: Deep shadow DOM search for csX pattern
+        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
+        while (walker.nextNode()) {
+            const match = walker.currentNode.textContent.trim().match(/^(cs[A-Za-z][A-Za-z0-9]+)$/);
+            if (match && match[1].length < 20) return match[1];
+        }
+        return null;
+    }
+
+    // =============================================
     // SETTINGS MENU UI
     // =============================================
     function createSettingsMenu() {
@@ -409,7 +575,7 @@
         headerTitle.textContent = '\u2699\uFE0F Poirot V3 Settings';
         headerTitle.style.cssText = 'font-size:16px;font-weight:bold;';
         const headerVersion = document.createElement('span');
-        headerVersion.textContent = 'v32.1';
+        headerVersion.textContent = 'v32.2';
         headerVersion.style.cssText = 'font-size:12px;color:#ff9900;background:#37475a;padding:2px 8px;border-radius:10px;';
         header.appendChild(headerTitle);
         header.appendChild(headerVersion);
@@ -599,89 +765,6 @@
                 setTimeout(() => { pressEnter(input); }, DELAY_BEFORE_ENTER);
             }
         }
-    }
-
-    function isVerifyPage() {
-        const c = document.querySelectorAll('span.text--size-xxl, h1, h2, h3, h4, h5, h6, [class*="title"], [class*="header"]');
-        for (const el of c) { if (el.textContent.replace(/\s+/g, ' ').trim().toLowerCase().includes('verify item')) return true; }
-        return false;
-    }
-    function isScanPage() {
-        const c = document.querySelectorAll('span.text--size-xxl, h1, h2, h3, h4, h5, h6, [class*="title"], [class*="header"]');
-        for (const el of c) { if (el.textContent.replace(/\s+/g, ' ').trim().toLowerCase().includes('scan item')) return true; }
-        return false;
-    }
-    function isQuantityPage() {
-        const c = document.querySelectorAll('span.text--size-xxl, h1, h2, h3, h4, h5, h6, [class*="title"], [class*="header"]');
-        for (const el of c) { if (el.textContent.replace(/\s+/g, ' ').trim().toLowerCase().includes('enter quantity')) return true; }
-        return false;
-    }
-    function isDestinationPage() {
-        const c = document.querySelectorAll('span.text--size-xxl, h1, h2, h3, h4, h5, h6, [class*="title"], [class*="header"]');
-        for (const el of c) {
-            const t = el.textContent.replace(/\s+/g, ' ').trim().toLowerCase();
-            if (t.includes('scan destination') || t.includes('destination container')) return true;
-        }
-        return false;
-    }
-
-    function isEmptyContainer() {
-        // Approach 1: Check specific span classes
-        const spans = document.querySelectorAll('span.text--size-lg, span.text');
-        for (const el of spans) {
-            if (el.textContent.trim().toLowerCase().includes('no items found')) return true;
-        }
-        // Approach 2: Check item quantity = 0 AND number of rows = 0
-        const bodyText = document.body.textContent.toLowerCase();
-        if (bodyText.includes('item quantity') && bodyText.includes('number of rows')) {
-            const qtyMatch = bodyText.match(/item\s*quantity[:\s]*(\d+)/i);
-            const rowMatch = bodyText.match(/number\s*of\s*rows[:\s]*(\d+)/i);
-            if (qtyMatch && rowMatch && qtyMatch[1] === '0' && rowMatch[1] === '0') {
-                console.log('[Poirot] Empty container detected via qty=0, rows=0');
-                return true;
-            }
-        }
-        // Approach 3: Broad text search for "no items found"
-        if (bodyText.includes('no items found in this container')) {
-            console.log('[Poirot] Empty container detected via body text search');
-            return true;
-        }
-        return false;
-    }
-
-    function getSourceContainerId() {
-        // Approach 1: Direct ID lookup
-        const label = document.getElementById('source-container-label');
-        if (label) {
-            const text = label.textContent.trim();
-            if (isValidContainerId(text)) return text;
-        }
-        // Approach 2: Search all elements near "Source Container" text
-        const allEls = document.querySelectorAll('span, div, p, label, h1, h2, h3, h4, h5, h6');
-        for (const el of allEls) {
-            const text = el.textContent.trim();
-            if (isValidContainerId(text)) {
-                const parent = el.parentElement;
-                if (parent) {
-                    const parentText = parent.textContent.toLowerCase();
-                    if (parentText.includes('source container') || parentText.includes('change container')) {
-                        console.log('[Poirot] Found container ID via parent context: ' + text);
-                        return text;
-                    }
-                }
-            }
-        }
-        // Approach 3: Just find any valid csX on the page (only on scan page)
-        if (isScanPage()) {
-            for (const el of allEls) {
-                const text = el.textContent.trim();
-                if (isValidContainerId(text) && text.length < 20) {
-                    console.log('[Poirot] Found container ID via broad scan: ' + text);
-                    return text;
-                }
-            }
-        }
-        return null;
     }
 
     function showFBALabelPopup() {
@@ -937,7 +1020,7 @@
         if (checkForFCData()) return;
         if (waitingForFC) return;
 
-        // Debug logging
+        // Page detection
         const onScan = isScanPage();
         const onDest = isDestinationPage();
         const onVerify = isVerifyPage();
@@ -949,7 +1032,7 @@
 
         if (isSidelineApp() && onScan && hasBanner) { handleSidelineSuccess(); return; }
 
-        // ONLY check for empty containers on the Scan Item page AND not during success cooldown
+        // Empty container check — on Scan Item page, no success banner, not in cooldown
         if (onScan && !hasBanner) {
             const cid = getSourceContainerId();
 
@@ -1013,6 +1096,6 @@
     observer.observe(document.body, { childList: true, subtree: true, characterData: true });
     setTimeout(mainCheck, 1500);
 
-    console.log('[Poirot Auto-Enter] v32.1 loaded — robust empty detection + debug logging.');
+    console.log('[Poirot Auto-Enter] v32.2 loaded — Shadow DOM aware page detection.');
 })();
 
